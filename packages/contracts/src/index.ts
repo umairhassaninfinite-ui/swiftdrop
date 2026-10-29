@@ -232,6 +232,46 @@ export const publicUserSchema = z.object({
   profileComplete: z.boolean(),
 });
 export type PublicUser = z.infer<typeof publicUserSchema>;
+export const staffRoleSchema = z.enum(["COURIER", "DISPATCHER"]);
+export const createStaffSchema = z
+  .object({
+    fullName: registrationSchema.shape.fullName,
+    email: emailSchema,
+    phone: registrationSchema.shape.phone,
+    role: staffRoleSchema,
+  })
+  .strict();
+export type CreateStaff = z.infer<typeof createStaffSchema>;
+export const staffUserSchema = z.object({
+  id: z.number().int().positive(),
+  email: emailSchema,
+  fullName: z.string(),
+  phone: z.string(),
+  role: staffRoleSchema,
+  status: z.enum(["INVITED", "ACTIVE", "SUSPENDED"]),
+  createdAt: z.string().datetime(),
+  invitationExpiresAt: z.string().datetime().nullable(),
+});
+export const staffPageSchema = z.object({
+  items: z.array(staffUserSchema).max(101),
+  nextCursor: z.string().nullable(),
+});
+export const invitationActionSchema = z
+  .object({ action: z.enum(["resend", "revoke"]) })
+  .strict();
+export const acceptInvitationSchema = z
+  .object({
+    token: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+    password: passwordSchema,
+  })
+  .strict();
+export const invitationResultSchema = z.object({
+  user: staffUserSchema,
+  delivery: z.enum(["sent", "failed", "not_sent"]),
+});
+export const acceptInvitationResultSchema = z.object({
+  message: z.string(),
+});
 export const sessionSchema = z.object({
   state: z.literal("authenticated"),
   accessToken: z.string(),

@@ -18,6 +18,13 @@ import {
   type BookingRequest,
   type ZoneInput,
   type PriceInput,
+  staffPageSchema,
+  invitationResultSchema,
+  acceptInvitationResultSchema,
+  createStaffSchema,
+  invitationActionSchema,
+  acceptInvitationSchema,
+  type CreateStaff,
 } from "@swiftdrop/contracts";
 const api = createClient<paths>({
   baseUrl: window.location.origin,
@@ -241,6 +248,66 @@ export async function addPrice(input: PriceInput) {
         "X-CSRF-Token": context.csrfToken,
       },
     }),
+  );
+}
+export async function listStaff(filters: {
+  role?: "COURIER" | "DISPATCHER";
+  status?: "INVITED" | "ACTIVE" | "SUSPENDED";
+  cursor?: string;
+}) {
+  const session = await bearer();
+  return staffPageSchema.parse(
+    await checked(
+      await api.GET("/api/v1/admin/users", {
+        params: { query: filters },
+        headers: { Authorization: `Bearer ${session.accessToken}` },
+      }),
+    ),
+  );
+}
+export async function createStaff(input: CreateStaff) {
+  const session = await bearer();
+  const context = await csrf();
+  return invitationResultSchema.parse(
+    await checked(
+      await api.POST("/api/v1/admin/users", {
+        body: createStaffSchema.parse(input),
+        headers: {
+          Authorization: `Bearer ${session.accessToken}`,
+          "X-CSRF-Token": context.csrfToken,
+        },
+      }),
+    ),
+  );
+}
+export async function updateInvitation(
+  id: number,
+  action: "resend" | "revoke",
+) {
+  const session = await bearer();
+  const context = await csrf();
+  return invitationResultSchema.parse(
+    await checked(
+      await api.POST("/api/v1/admin/users/{id}/invitation", {
+        params: { path: { id: String(id) } },
+        body: invitationActionSchema.parse({ action }),
+        headers: {
+          Authorization: `Bearer ${session.accessToken}`,
+          "X-CSRF-Token": context.csrfToken,
+        },
+      }),
+    ),
+  );
+}
+export async function acceptInvitation(token: string, password: string) {
+  const context = await csrf();
+  return acceptInvitationResultSchema.parse(
+    await checked(
+      await api.POST("/api/v1/auth/accept-invite", {
+        body: acceptInvitationSchema.parse({ token, password }),
+        headers: { "X-CSRF-Token": context.csrfToken },
+      }),
+    ),
   );
 }
 export async function verifyEmail(token: string) {

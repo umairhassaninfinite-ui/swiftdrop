@@ -10,7 +10,7 @@ Work distribution (29 October 2026): [plan.md §4](plan.md#4-team-structure-and-
 
 | Member | Name | Branch | Planned slice (plan.md §4.1) | Delivered vs merged | Depends on | Next step |
 | :-- | :-- | :-- | :-- | :-- | :-- | :-- |
-| [M01](#m01) | doktur-umair | `umair-dev` | Identity, access and user administration (+ silent-work steward) | Auth, Google, verification, booking/pricing/tracking, relay code and reconciled documentation committed and pushed to `umair-dev`; merge to `main` not verified | X-01 (M10), X-03 (M08/M09) | FR-A5 staff provisioning/suspension and Admin users UI; split combined code to slice owners (C-02) |
+| [M01](#m01) | doktur-umair | `umair-dev` | Identity, access and user administration (+ silent-work steward) | Sprint 1 dispatcher invitation provisioning/API/Admin UI implemented locally, uncommitted; prior auth/Google/verification and other historical work as recorded; merge to `main` not verified | X-01/X-13 (M10 review), X-15 (M06 readiness), X-03 (M08/M09) | Obtain M10 schema/contract review for C-03 and M06 courier readiness for C-04; then integrate; Sprint 2 suspension/bootstrap remains next; C-02 handoff open |
 | [M02](#m02) | TBD | TBD | Merchant platform | No work recorded | X-05, X-11 | Merchant tables, registration/approval against fake `ParcelsService` |
 | [M03](#m03) | TBD | TBD | Pricing, zones and reports | No work recorded (pricing/quote baseline exists in M01's local code, C-02) | X-04 | Take over pricing code; FR-I7 reports |
 | [M04](#m04) | TBD | TBD | Customer booking and parcel records | No work recorded (booking baseline exists in M01's local code, C-02) | X-04, X-06, X-09 | Take over booking code; merchant/staff variants |
@@ -21,7 +21,7 @@ Work distribution (29 October 2026): [plan.md §4](plan.md#4-team-structure-and-
 | [M09](#m09) | TBD | TBD | Notifications and realtime | No work recorded | X-03, X-08, X-09 | Notification templates, realtime gateway |
 | [M10](#m10) | TBD | TBD | Platform kernel and web foundation | No work recorded | None (foundation) | Kernel, shell, typed client, MSW harness |
 
-Integration target: `main`. Checked revision/date: `umair-dev`, 29 October 2026. Merge order: kernel and contracts (X-01, X-09) → identity guards (X-02) → pricing/parcels/lifecycle (X-04–X-06) → dispatch/courier (X-07, X-08) → messaging consumers (X-10–X-12) → UI composition (X-13). Combined ten-branch verification: not performed. Release blockers: no other member has registered or delivered work; production gates listed in the M01 checkpoints remain open.
+Integration target: `main`. Checked base revision/date: `umair-dev` at `7a348f8`, 30 October 2026; Sprint 1 implementation and verification are current uncommitted working-tree changes. Merge order: kernel and contracts (X-01, X-09) → identity guards (X-02) → pricing/parcels/lifecycle (X-04–X-06) → dispatch/courier (X-07, X-08) → messaging consumers (X-10–X-12) → UI composition (X-13). Local M01 checks passed; combined ten-branch verification was not performed. Release blockers: M10 schema/contract review (C-03), M06 courier readiness contract (C-04/X-15), no other member branches inspected, and production gates listed in M01 checkpoints.
 
 ### Dependency and contract register
 
@@ -43,6 +43,7 @@ Contract definitions are in [plan.md §10](plan.md#10-integration-contracts-betw
 | X-12 | M09 → web | Socket.IO `parcel:status` / `parcel:assigned` | Not created | Planned | None |
 | X-13 | every member → M10 | `routes.tsx`, `nav.ts`, MSW handlers | `apps/web/src/features/*` | Planned | None |
 | X-14 | every member → M01 | Dockerfile/Compose/CI/Helm entries | `compose*.yaml`, `.github/` | Compose/CI exist from M01; per-service entries planned | Local tree only |
+| X-15 | M06 ↔ M01 | Proposed courier profile/readiness contract before invitation activation; `docs/auth.md` §4.5 | `modules/users`, future M06 courier profile module/schema | Unagreed; dispatcher onboarding proceeds independently; courier acceptance returns setup-pending without consuming its invitation until required fields, writer and atomicity are agreed | M01 Sprint 1 implementation checkpoint, 30 October 2026; C-04; no M06 branch inspected |
 
 ### Contradictions and overlaps
 
@@ -50,6 +51,8 @@ Contract definitions are in [plan.md §10](plan.md#10-integration-contracts-betw
 | :-- | :-- | :-- | :-- | :-- | :-- | :-- |
 | C-01 | All | `docs/auth.md` phase tables and the earlier handover "Phase 1" entry assign work to layer-based roles A1–E2; [plan.md §4.1](plan.md#4-team-structure-and-ownership) assigns vertical slices M01–M10. | Wrong owner named in an auth phase; duplicated or skipped work | Ownership note in `docs/auth.md` plus plan §4.6 crosswalk; history preserved | M01 / each slice owner | implemented (documentation only) |
 | C-02 | M01, M03, M04, M05, M08 | Plan assigns pricing (M03), booking (M04), tracking (M05) and relay (M08) to separate owners; the delivered code keeps quotes, booking, public tracking and the AMQP relay in `apps/core-api/src/modules/parcels/{routes,service,events}.ts` and `apps/web/src/features/parcels`. | Merge conflicts and unclear ownership on first touch by new owners | No-behaviour-change refactor PRs split the module per plan §4.1 before feature work in that area | M01 (author) with the receiving owner as reviewer | open |
+| C-03 | M01, M10; shared-schema owners | Plan §4.1/§7.5 expects per-domain `identity.prisma`; actual `packages/db/prisma.config.ts` and integration harness target one `prisma/schema.prisma`. X-02 says `req.user`, while `modules/auth/index.ts` implements `res.locals.user`/`authFamilyId`; Sprint 1 adds an invitation model/migration to the current schema path on M01's branch. | Schema ownership/review and downstream authentication consumers need a recorded contract before integration | M10 and affected owners review the additive current-schema migration or agree a coordinated split; preserve current middleware and reconcile interface wording | M01 with M10 and affected schema/contract reviewers | open (implementation local; shared review and schema-path decision pending) |
+| C-04 | M01, M06 | FR-A5 requires courier provisioning; `docs/auth.md` §4.5 requires a usable courier profile before activation, but no courier profile schema/module or M06 delivery is available locally. | Activating a role-only courier could imply operational readiness without capacity/profile data | Proposed X-15 defines required fields, responsibility and atomic activation; local Sprint 1 lets admins invite couriers but returns setup-pending on acceptance without consuming the invitation | M01 with M06 | open (runtime guard implemented locally; M06 contract and courier completion are not agreed/claimed) |
 
 Evidence boundary: only the working tree on `umair-dev` and the documents named above were inspected. No other branch, fetched revision or pull request was available; all M02–M10 dependencies are unverified.
 
@@ -413,6 +416,79 @@ Setup: no commands needed; open `/Users/umairhassan/Desktop/ead/plan.md` in a Ma
 
 ### Cross-member dependencies
 Produced by M01 for others: `authenticate/requireRole` and service-JWT verifier contract (X-02, X-03); steward review of silent work (X-14). Consumed by M01: kernel from M10 (X-01), worker-lookup requirements from M08/M09 (X-03). Status: planned; see the register in [Shared integration](#shared-integration). Counterparts: [M08](#m08), [M09](#m09), [M10](#m10).
+
+### Planning: M01 remaining sprints and first-sprint implementation plan (30 October 2026)
+
+**Member:** M01 — doktur-umair · **Branch:** `umair-dev` · **Task:** divide remaining M01 work into detailed sprints, keep `m01.md` local, and plan Sprint 1 · **Reference:** uncommitted; inspected source revision `7a348f8`. Planning only; application behavior is unchanged and nothing is marked implemented, reviewed by other members or merged.
+
+#### Summary and durable planning decisions
+
+- Created the intentionally ignored root `m01.md` and added the exact root rule `/m01.md` to `.gitignore`. It is a local working plan; `plan.md` remains the shared ownership authority and this checkpoint retains decisions needed by other contributors without requiring the ignored file.
+- Defined five **local M01** sprints, distinct from the repository's Sprint 0–5 numbering: (1) staff provisioning/invitations and Admin users UI, estimated 6–8 focused engineering days; (2) atomic suspension/reactivation, Admin safeguards and operator bootstrap, 5–7 days; (3) service identities/X-03, 4–6 days; (4) auth hardening and live/manual acceptance, 4–6 days; (5) integration/handoff and infrastructure stewardship, 3–5 days. Estimates exclude external review, blocked integration and separately sized security extensions; no deadline or team availability was supplied.
+- Local Sprint 1 plans strict Admin-only staff creation/listing, hashed 24-hour single-use invitations, resend/revoke, explicit private-password acceptance, bounded cleanup, generated contracts/client, Mailpit delivery with honest failure feedback, role/token/concurrency checks, accessible users/invitation screens and manual acceptance. These are proposed additions, not existing endpoints. FR-A5 is partial after provisioning and completes only with Sprint 2 suspension.
+- Proposed endpoint additions: `GET/POST /api/v1/admin/users`, `POST /api/v1/admin/users/{id}/invitation` with explicit resend/revoke action, and `POST /api/v1/auth/accept-invite`. User creation is limited to `COURIER`/`DISPATCHER`; existing identities are never silently converted. Admins do not choose staff passwords. Invitation acceptance activates/sets password/verifies mailbox atomically and then requires ordinary login. Shared DTO/schema review is required before dependent implementation.
+- Reuse current auth guards, CSRF/origin/JSON protections, password helpers, session provider, typed transport, mail adapter and test harness. Synchronous SMTP is a local/demo delivery adapter, not guaranteed delivery; persist before sending and support bounded explicit resend. Recovery, MFA, durable security mail and audit remain separately sized production gates.
+
+#### Dependencies, overlaps and future work
+
+- Produces X-02 user-administration behavior and planned X-03 worker verifier; consumes [M10](#m10) composition/schema review under X-01/X-13. [M02](#m02) is the review pair for human/machine identity boundaries. No review approval is claimed.
+- Added proposed X-15 and C-04 for [M06](#m06) courier profile/readiness. Dispatcher onboarding remains independently demoable; courier activation is blocked until required fields, owning writer and atomicity are agreed and implemented. Inviting a courier alone does not establish usable courier onboarding.
+- Recorded C-03: current single Prisma file and `res.locals.user` implementation differ from the planned per-domain files/`req.user` wording. Choose the schema path and reconcile the middleware contract before dependent code. No broad schema refactor is implied by this planning task.
+- C-02 remains open; any pricing/booking/tracking/relay split requires receiving-owner coordination. M01 stewardship reviews each member's infrastructure entries; other slices are not added to M01 implementation scope. Helm remains separately estimated stretch work after baseline acceptance.
+- Evidence boundary: only the local `umair-dev` working tree and named source/documents were inspected. M02–M10 branches, remote repository settings, hosted CI, live Google and browser acceptance were not checked. Next implementation work is Sprint 1 contract/schema review; this planning request does not start application development.
+
+#### Verification and manual documentation review
+
+- Passed `git diff --check` and focused structural checks: five sequential local sprint sections with Sprint 1 detail, balanced Markdown fences, ten permanent member sections/anchors, previous M01 history preserved verbatim, and other member histories unchanged. `git check-ignore -v m01.md` confirms the root ignore rule; `git ls-files -- m01.md` confirms the plan is untracked. Runtime/build/browser checks are not applicable to this documentation/ignore-only iteration; Markdown preview rendering was not checked. No previous runtime results are re-attributed to this work.
+- Setup/review commands from `/Users/umairhassan/Desktop/ead`: `git diff -- .gitignore handover.md`, `git check-ignore -v m01.md`, `git ls-files -- m01.md`, `git diff --check`. No server is needed.
+1. Open local `m01.md` in a Markdown preview. Expect five sequential local sprints with outcomes, estimates, scope, dependencies, tests, manual acceptance and exit criteria; no claim that repository Sprint 2/3 is being restarted.
+2. Read Sprint 1. Expect actual current files/helpers, proposed endpoints, transaction/token/mail rules, ordered work packages, exact post-implementation setup/check commands, dispatcher demo and explicit courier readiness blocker. Runtime routes are future targets, not available from this documentation change.
+3. Review `.gitignore` output. Expect `/m01.md` matches the local plan; `git ls-files -- m01.md` prints nothing. `git diff -- .gitignore handover.md` should contain only the exact ignore addition and this shared/M01 planning record. Other contributors can recover shared decisions here without the ignored plan.
+4. Edge/failure review: no other member history is rewritten; C-02 remains open; X-15/C-03/C-04 stay unagreed/open; no secrets, runtime verification, integration or production-readiness claims appear. Responsive/runtime acceptance is not applicable until the corresponding screens exist; the local plan supplies the future numbered test cases.
+
+### Implementation: M01 Sprint 1 staff invitations (30 October 2026)
+
+**Member:** M01 — doktur-umair · **Branch:** `umair-dev` · **Task:** implement local M01 Sprint 1 staff provisioning/invitations and Admin users UI · **Reference:** uncommitted; base revision `7a348f8`. Implemented locally; not reviewed by another member and not merged.
+
+#### Summary and touched modules
+
+- Added strict shared DTOs and generated OpenAPI/client paths for bounded staff list/filter, staff invitation creation, resend/revoke and acceptance. Added a `StaffInvitation` model and additive `202610300001_staff_invitations` migration to current `packages/db/prisma/schema.prisma`; existing migrations were not edited.
+- Added `modules/users` for Admin-only staff list/create/invitation actions and explicit acceptance. New users are limited to COURIER/DISPATCHER and start `INVITED` with no password. Tokens are random 32-byte values, stored only as SHA-256 hashes, expire in 24 hours and are consumed once. Dispatcher acceptance atomically sets bcrypt-12 password, verifies mailbox ownership and activates the user; normal login remains a separate step.
+- Added post-commit SMTP invitation delivery, truthful sent/failed/not-sent status, a one-minute resend cooldown and bounded expired-invitation cleanup. Mail delivery failure retains the invited account for explicit retry. No raw invitation token is returned in API responses.
+- Added Admin list/filter/pagination/create/resend/revoke screens, `/auth/accept-invite` password UI, URL-fragment removal, password confirmation, accessible loading/error/empty notices and responsive horizontal table scrolling. Updated auth docs and the ignored local `m01.md` implementation status.
+- Courier records can be invited, but acceptance returns setup-pending and leaves the invitation/user unchanged until M06 defines profile readiness. C-03 remains open: the additive table and generated client use current shared files and still need M10 schema/contract review. See [X-15/C-04](#shared-integration) and [M06](#m06). No other member branch or PR was inspected.
+
+#### Issues and next work
+
+- **C-03 open:** current single Prisma schema path was used for a local, tested additive migration; M10 review and the shared schema-path/interface decision remain required before merge/integration.
+- **C-04/X-15 open:** courier acceptance remains safely blocked; M06 must agree required profile fields, owning writer and atomic activation before this path can be completed.
+- M01 Sprint 2 suspension/reactivation and operator admin bootstrap, Sprint 3 worker identity, live browser/Mailpit acceptance and cross-branch review remain future work. SMTP handoff is not guaranteed mailbox delivery; recovery, MFA, audit trail and durable mail are not included.
+
+#### Automated verification
+
+- Passed `pnpm db:generate`, `pnpm contracts:generate`, `pnpm contracts:check`, `pnpm typecheck`, `pnpm lint`, `pnpm format:check`, `pnpm test`, `pnpm test:integration`, `pnpm build`, `pnpm test:built`, and `git diff --check` on this working tree. API/web unit suites: 24/24 and 13/13; migration-backed API integration suite: 33/33. Integration deploys migrations to disposable PostgreSQL and checks Prisma migration drift. Reported aggregate integration coverage: 83.7% statements, 78.94% branches, 84.98% lines.
+- No live browser, Mailpit UI, responsive-device/zoom/keyboard pass, Google flow, other member branch, hosted CI, or merged-main verification was performed. Tests prove dispatcher API setup/acceptance and courier setup blocking; they do not prove email reaches a mailbox or the UI is manually accepted.
+
+#### Setup and manual acceptance (not yet run by a human)
+
+From `/Users/umairhassan/Desktop/ead`, use Node 24 and pnpm 11, with Docker running:
+
+```sh
+cp -n .env.example .env
+pnpm install --frozen-lockfile
+pnpm auth:keys:generate # initial setup only; preserve existing keys
+pnpm db:generate
+docker compose up -d --wait
+pnpm db:migrate
+pnpm db:seed # disposable local database only
+pnpm dev
+```
+
+1. Sign in at `http://localhost:5173/auth/login` with the README's seeded admin credentials and open `/admin/users`. Expect staff-only rows, role/status filters, bounded pagination and a labelled invite action. Check empty/error/retry states and narrow 360px and desktop widths.
+2. Open `/admin/users/new`; submit invalid/empty fields, then create a unique dispatcher. Expect validation and no duplicate submit; a successful result is `INVITED` with truthful delivery state. Open `http://localhost:8025`, follow the email link, and expect the token fragment to disappear without activation on GET.
+3. Set a valid private password and confirm it. Expect `ACTIVE`/verified state, then sign in through `/auth/login`; acceptance alone must not create a session. Retry the old token and expect a safe rejection.
+4. After the resend cooldown, resend an invitation and try both email links: only the newest link should work. Revoke another invitation after confirmation and verify its link fails. Stop Mailpit/SMTP and create a separate invite; expect the invited user remains and Admin sees a retry instruction.
+5. Invite a courier before M06 readiness is agreed; submit its link and expect setup-pending, no activation and no token consumption. Check anonymous/Dispatcher access is denied by the API, CSRF/Origin failures are rejected, and keyboard focus/status announcements remain usable at 200% zoom/reduced motion.
 
 <a id="m02"></a>
 ## M02 — TBD

@@ -19,6 +19,7 @@ import type { AuthMailer } from "./modules/auth/mail.js";
 import type { GoogleOidc } from "./modules/auth/google.js";
 import { ParcelService } from "./modules/parcels/service.js";
 import { createParcelRouter } from "./modules/parcels/routes.js";
+import { UsersService, createUsersRouter } from "./modules/users/index.js";
 export function createApp(deps: {
   db: Database;
   redis: Redis;
@@ -99,16 +100,18 @@ export function createApp(deps: {
     deps.google,
     logger,
   );
+  const users = new UsersService(db, config.APP_ORIGIN, deps.mailer);
   const limiter = new RateLimiter(redis, config.rateSecret);
   app.get("/api/v1/auth/me", authenticate(service), (_req, res) =>
     res.json(res.locals.user),
   );
-  app.use("/api/v1/auth", createAuthRouter(service, limiter, config));
+  app.use("/api/v1/auth", createAuthRouter(service, limiter, config, users));
+  app.use("/api/v1/admin/users", createUsersRouter(users, service, config));
   const parcels = new ParcelService(db);
   app.use("/api/v1", createParcelRouter(parcels, service, limiter, config));
   app.use((_req, _res, next) =>
     next(new HttpError(404, "NOT_FOUND", "This route does not exist.")),
   );
   app.use(errorHandler(logger));
-  return { app, service, limiter };
+  return { app, service, users, limiter };
 }

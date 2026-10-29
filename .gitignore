@@ -14,3 +14,6 @@ build/
 coverage/
 packages/db/src/generated/
 *.tsbuildinfo
+
+# Local M01 sprint planning
+/m01.md

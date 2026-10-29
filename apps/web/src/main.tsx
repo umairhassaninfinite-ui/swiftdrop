@@ -22,6 +22,7 @@ import {
   resendVerification,
 } from "./features/auth/client.js";
 import { VerifyEmail } from "./features/auth/verification.js";
+import { AcceptInvite } from "./features/auth/accept-invite.js";
 import {
   CompleteProfile,
   GoogleResult,
@@ -36,6 +37,7 @@ import {
   ParcelList,
   PublicTracking,
 } from "./features/parcels/pages.js";
+import { AdminUsers, NewStaff } from "./features/users/pages.js";
 import "./styles.css";
 function Guard({ role, children }: { role: Role; children: ReactNode }) {
   const { state } = useSession();
@@ -121,6 +123,7 @@ function Account() {
       )}
       {state.user?.role === "ADMIN" && (
         <div className="notice account-links">
+          <Link to="/admin/users">Staff users</Link>
           <Link to="/admin/zones">Service districts</Link>
           <Link to="/admin/pricing">Pricing</Link>
         </div>
@@ -247,6 +250,7 @@ function App() {
               <Route path="/auth/login" element={<AuthForm />} />
               <Route path="/auth/register" element={<AuthForm registering />} />
               <Route path="/auth/verify-email" element={<VerifyEmail />} />
+              <Route path="/auth/accept-invite" element={<AcceptInvite />} />
               <Route path="/auth/google/result" element={<GoogleResult />} />
               <Route
                 path="/auth/complete-profile"
@@ -274,6 +278,22 @@ function App() {
                 element={
                   <Guard role="CUSTOMER">
                     <ParcelDetail />
+                  </Guard>
+                }
+              />
+              <Route
+                path="/admin/users"
+                element={
+                  <Guard role="ADMIN">
+                    <AdminUsers />
+                  </Guard>
+                }
+              />
+              <Route
+                path="/admin/users/new"
+                element={
+                  <Guard role="ADMIN">
+                    <NewStaff />
                   </Guard>
                 }
               />

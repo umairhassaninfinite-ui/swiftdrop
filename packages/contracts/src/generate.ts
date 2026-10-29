@@ -27,6 +27,12 @@ import {
   zoneSchema,
   priceInputSchema,
   priceSchema,
+  createStaffSchema,
+  staffPageSchema,
+  invitationActionSchema,
+  invitationResultSchema,
+  acceptInvitationSchema,
+  acceptInvitationResultSchema,
 } from "./index.js";
 extendZodWithOpenApi(z);
 const registry = new OpenAPIRegistry();
@@ -203,6 +209,109 @@ for (const [method, path, input, output, status, bearer] of [
         ? bearer
           ? [{ bearerAuth: [] }]
           : []
+        : [{ csrfHeader: [], ...(bearer ? { bearerAuth: [] } : {}) }],
+    ...(input
+      ? { request: { body: { required: true, content: json(input) } } }
+      : {}),
+    responses: {
+      [status]: {
+        description: "Success",
+        ...(output ? { content: json(output) } : {}),
+      },
+      ...Object.fromEntries(
+        [400, 401, 403, 404, 409, 410, 413, 415, 422, 429, 503].map((code) => [
+          code,
+          {
+            description: "Request rejected",
+            content: { "application/problem+json": { schema: problemSchema } },
+          },
+        ]),
+      ),
+    },
+  });
+}
+for (const [method, path, input, output, status, bearer] of [
+  ["get", "/api/v1/admin/users", null, staffPageSchema, 200, true],
+  [
+    "post",
+    "/api/v1/admin/users",
+    createStaffSchema,
+    invitationResultSchema,
+    201,
+    true,
+  ],
+  [
+    "post",
+    "/api/v1/admin/users/{id}/invitation",
+    invitationActionSchema,
+    invitationResultSchema,
+    200,
+    true,
+  ],
+  [
+    "post",
+    "/api/v1/auth/accept-invite",
+    acceptInvitationSchema,
+    acceptInvitationResultSchema,
+    200,
+    false,
+  ],
+] as const) {
+  registry.registerPath({
+    method,
+    path,
+    summary: path,
+    ...(path.includes("{id}")
+      ? {
+          parameters: [
+            {
+              name: "id",
+              in: "path" as const,
+              required: true,
+              schema: { type: "string" as const },
+            },
+          ],
+        }
+      : {}),
+    ...(method === "get" && path === "/api/v1/admin/users"
+      ? {
+          parameters: [
+            {
+              name: "role",
+              in: "query" as const,
+              required: false,
+              schema: {
+                type: "string" as const,
+                enum: ["COURIER", "DISPATCHER"],
+              },
+            },
+            {
+              name: "status",
+              in: "query" as const,
+              required: false,
+              schema: {
+                type: "string" as const,
+                enum: ["INVITED", "ACTIVE", "SUSPENDED"],
+              },
+            },
+            {
+              name: "cursor",
+              in: "query" as const,
+              required: false,
+              schema: { type: "string" as const },
+            },
+            {
+              name: "limit",
+              in: "query" as const,
+              required: false,
+              schema: { type: "integer" as const, minimum: 1, maximum: 100 },
+            },
+          ],
+        }
+      : {}),
+    security:
+      method === "get"
+        ? [{ bearerAuth: [] }]
         : [{ csrfHeader: [], ...(bearer ? { bearerAuth: [] } : {}) }],
     ...(input
       ? { request: { body: { required: true, content: json(input) } } }

@@ -9,6 +9,7 @@ import {
   verifyEmailSchema,
   completeProfileSchema,
   googleLinkSchema,
+  acceptInvitationSchema,
 } from "@swiftdrop/contracts";
 import type { Config } from "../../shared/config.js";
 import { HttpError } from "../../shared/problem.js";
@@ -16,6 +17,7 @@ import type { RateLimiter } from "../../shared/rate-limit.js";
 import { AuthService } from "./service.js";
 import { authenticate, requireRole } from "./index.js";
 import { publicUser } from "./service.js";
+import type { UsersService } from "../users/service.js";
 export const cookieNames = (secure: boolean) => ({
   refresh: secure ? "__Host-swiftdrop-refresh" : "swiftdrop-refresh",
   csrf: secure ? "__Host-swiftdrop-csrf" : "swiftdrop-csrf",
@@ -26,6 +28,7 @@ export function createAuthRouter(
   service: AuthService,
   limiter: RateLimiter,
   config: Config,
+  users: UsersService,
 ) {
   const router = Router();
   const names = cookieNames(config.secure);
@@ -139,6 +142,15 @@ export function createAuthRouter(
           `${config.APP_ORIGIN}/auth/google/result?status=${status}`,
         );
       }
+    },
+  );
+  router.post(
+    "/accept-invite",
+    limiter.middleware("accept-invite", 10, 900),
+    async (req, res) => {
+      const input = acceptInvitationSchema.parse(req.body);
+      await users.accept(input.token, input.password);
+      res.json({ message: "Your account is ready. Sign in to continue." });
     },
   );
   router.post(

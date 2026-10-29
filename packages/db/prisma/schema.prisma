@@ -40,10 +40,26 @@ model User {
   updatedAt    DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
   sessions     AuthSession[]
   verificationTokens VerificationToken[]
+  staffInvitations StaffInvitation[]
   oauthTransactions OAuthTransaction[]
   quotes Quote[]
   parcels Parcel[]
   @@map("users")
+}
+
+model StaffInvitation {
+  id         String   @id @default(uuid()) @db.Uuid
+  userId     Int      @map("user_id")
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash  String   @unique @map("token_hash") @db.Char(64)
+  generation Int
+  expiresAt  DateTime @map("expires_at") @db.Timestamptz(3)
+  consumedAt DateTime? @map("consumed_at") @db.Timestamptz(3)
+  revokedAt  DateTime? @map("revoked_at") @db.Timestamptz(3)
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  @@index([userId, generation])
+  @@index([expiresAt])
+  @@map("staff_invitations")
 }
 
 model Zone {

@@ -41,6 +41,7 @@ let api: ReturnType<typeof createApp>;
 let config: Config;
 let hash: string;
 let verificationLink = "";
+let invitationLink = "";
 let mailFailure = false;
 let googleIdentityEmail = "google@example.test";
 async function user(role: RoleName = "CUSTOMER", email = input.email) {
@@ -175,6 +176,10 @@ beforeAll(async () => {
         if (mailFailure) throw new Error("smtp unavailable");
         verificationLink = url;
       },
+      sendInvitation: async (_email, url) => {
+        if (mailFailure) throw new Error("smtp unavailable");
+        invitationLink = url;
+      },
     },
     google: {
       enabled: () => true,
@@ -200,6 +205,7 @@ beforeEach(async () => {
   await db.$executeRaw`TRUNCATE outbox_events, consumer_progress, idempotency_records`;
   await redis.flushdb();
   verificationLink = "";
+  invitationLink = "";
   mailFailure = false;
   googleIdentityEmail = "google@example.test";
 });
@@ -210,6 +216,185 @@ afterAll(async () => {
   await postgres?.stop();
 });
 describe("customer HTTP boundary", () => {
+  it("invites a dispatcher, activates only on explicit acceptance, and then allows ordinary login", async () => {
+    const admin = await user("ADMIN", "admin@example.test");
+    const agent = request.agent(api.app);
+    const logged = await post(agent, "login", { email: admin.email, password });
+    const csrf = await agent.get("/api/v1/auth/csrf").expect(200);
+    const created = await agent
+      .post("/api/v1/admin/users")
+      .set("Origin", config.APP_ORIGIN)
+      .set("X-CSRF-Token", csrf.body.csrfToken)
+      .set("Authorization", `Bearer ${logged.body.accessToken}`)
+      .send({
+        fullName: "Dispatch Staff",
+        email: "dispatch@example.test",
+        phone: "0771234567",
+        role: "DISPATCHER",
+      })
+      .expect(201);
+    expect(created.body.user).toMatchObject({
+      role: "DISPATCHER",
+      status: "INVITED",
+      email: "dispatch@example.test",
+    });
+    expect(created.body.user.passwordHash).toBeUndefined();
+    expect(created.body.delivery).toBe("sent");
+    const invited = await db.user.findUniqueOrThrow({
+      where: { email: "dispatch@example.test" },
+    });
+    expect(invited.passwordHash).toBeNull();
+    expect(invited.emailVerifiedAt).toBeNull();
+    expect(invitationLink).toContain("/auth/accept-invite#token=");
+    const rawToken = new URL(invitationLink).hash.slice("#token=".length);
+    expect(
+      (
+        await db.staffInvitation.findFirstOrThrow({
+          where: { userId: invited.id },
+        })
+      ).tokenHash,
+    ).not.toBe(rawToken);
+    expect(
+      (await post(agent, "accept-invite", { token: rawToken, password }))
+        .status,
+    ).toBe(200);
+    const active = await db.user.findUniqueOrThrow({
+      where: { id: invited.id },
+    });
+    expect(active).toMatchObject({ status: "ACTIVE", roleId: "DISPATCHER" });
+    expect(active.emailVerifiedAt).toBeInstanceOf(Date);
+    expect(bcrypt.getRounds(active.passwordHash!)).toBe(12);
+    expect(
+      (await post(agent, "accept-invite", { token: rawToken, password }))
+        .status,
+    ).toBe(400);
+    expect(
+      (await post(agent, "login", { email: invited.email, password })).status,
+    ).toBe(200);
+  });
+
+  it("keeps courier invitations unconsumed until operational setup is ready", async () => {
+    const admin = await user("ADMIN", "admin@example.test");
+    const agent = request.agent(api.app);
+    const logged = await post(agent, "login", { email: admin.email, password });
+    const csrf = await agent.get("/api/v1/auth/csrf").expect(200);
+    await agent
+      .post("/api/v1/admin/users")
+      .set("Origin", config.APP_ORIGIN)
+      .set("X-CSRF-Token", csrf.body.csrfToken)
+      .set("Authorization", `Bearer ${logged.body.accessToken}`)
+      .send({
+        fullName: "Courier Staff",
+        email: "courier@example.test",
+        phone: "0771234567",
+        role: "COURIER",
+      })
+      .expect(201);
+    const courier = await db.user.findUniqueOrThrow({
+      where: { email: "courier@example.test" },
+    });
+    const rawToken = new URL(invitationLink).hash.slice("#token=".length);
+    expect(
+      (await post(agent, "accept-invite", { token: rawToken, password }))
+        .status,
+    ).toBe(409);
+    expect(
+      await db.staffInvitation.findFirstOrThrow({
+        where: { userId: courier.id },
+      }),
+    ).toMatchObject({ consumedAt: null, revokedAt: null });
+    expect(
+      (await db.user.findUniqueOrThrow({ where: { id: courier.id } })).status,
+    ).toBe("INVITED");
+  });
+
+  it("lists only staff and rotates/revokes invitations while retaining mail-failed accounts", async () => {
+    const admin = await user("ADMIN", "admin@example.test");
+    const agent = request.agent(api.app);
+    const logged = await post(agent, "login", { email: admin.email, password });
+    async function adminPost(path: string, body: object) {
+      const csrf = await agent.get("/api/v1/auth/csrf").expect(200);
+      return agent
+        .post(path)
+        .set("Origin", config.APP_ORIGIN)
+        .set("X-CSRF-Token", csrf.body.csrfToken)
+        .set("Authorization", `Bearer ${logged.body.accessToken}`)
+        .send(body);
+    }
+    mailFailure = true;
+    const failedMail = await adminPost("/api/v1/admin/users", {
+      fullName: "No Mail Staff",
+      email: "nomail@example.test",
+      phone: "0771234567",
+      role: "DISPATCHER",
+    });
+    expect(failedMail.status).toBe(201);
+    expect(failedMail.body.delivery).toBe("failed");
+    expect(
+      (
+        await db.user.findUniqueOrThrow({
+          where: { email: "nomail@example.test" },
+        })
+      ).status,
+    ).toBe("INVITED");
+    mailFailure = false;
+    expect(
+      (
+        await adminPost("/api/v1/admin/users", {
+          fullName: "Rotate Staff",
+          email: "rotate@example.test",
+          phone: "0771234567",
+          role: "DISPATCHER",
+        })
+      ).status,
+    ).toBe(201);
+    const rotating = await db.user.findUniqueOrThrow({
+      where: { email: "rotate@example.test" },
+    });
+    const oldToken = new URL(invitationLink).hash.slice("#token=".length);
+    const listing = await agent
+      .get("/api/v1/admin/users?role=DISPATCHER&status=INVITED")
+      .set("Authorization", `Bearer ${logged.body.accessToken}`)
+      .expect(200);
+    expect(
+      listing.body.items.map((item: { email: string }) => item.email),
+    ).toEqual(
+      expect.arrayContaining(["nomail@example.test", "rotate@example.test"]),
+    );
+    expect(listing.body.items[0].passwordHash).toBeUndefined();
+    await db.staffInvitation.updateMany({
+      where: { userId: rotating.id },
+      data: { createdAt: new Date(Date.now() - 61_000) },
+    });
+    expect(
+      (
+        await adminPost(`/api/v1/admin/users/${rotating.id}/invitation`, {
+          action: "resend",
+        })
+      ).status,
+    ).toBe(200);
+    const newToken = new URL(invitationLink).hash.slice("#token=".length);
+    expect(newToken).not.toBe(oldToken);
+    expect(
+      (await post(agent, "accept-invite", { token: oldToken, password }))
+        .status,
+    ).toBe(400);
+    expect(
+      (
+        await adminPost(`/api/v1/admin/users/${rotating.id}/invitation`, {
+          action: "revoke",
+        })
+      ).status,
+    ).toBe(200);
+    expect(
+      (await post(agent, "accept-invite", { token: newToken, password }))
+        .status,
+    ).toBe(400);
+    expect(
+      (await db.user.findUniqueOrThrow({ where: { id: rotating.id } })).status,
+    ).toBe("INVITED");
+  });
+
   it("registers an active customer with bcrypt-12 and returns a safe canonical profile", async () => {
     const agent = request.agent(api.app);
     const created = await post(agent, "register", {
@@ -535,6 +720,7 @@ describe("grant and refresh lifecycle", () => {
       families: 0,
       verificationTokens: 0,
       oauthTransactions: 0,
+      staffInvitations: 0,
     });
     expect(await db.refreshToken.count()).toBe(2);
     await db.authSession.updateMany({
@@ -548,6 +734,7 @@ describe("grant and refresh lifecycle", () => {
       families: 1,
       verificationTokens: 0,
       oauthTransactions: 0,
+      staffInvitations: 0,
     });
     expect(await db.refreshToken.count()).toBe(0);
     expect(await db.authSession.count()).toBe(0);
