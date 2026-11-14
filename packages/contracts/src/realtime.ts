@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { TRACKING_PATTERN } from "./tracking";
 import { parcelStatusSchema } from "./lifecycle.js";
 
 /**
@@ -78,6 +79,6 @@ export const parcelSnapshotSchema = z
 export type ParcelSnapshot = z.infer<typeof parcelSnapshotSchema>;
 
 export const trackJoinSchema = z
-  .object({ trackingNumber: z.string().regex(/^SD[A-Z0-9]{8}$/) })
+  .object({ trackingNumber: z.string().regex(TRACKING_PATTERN) })
   .strict();
 export const parcelJoinSchema = z.object({ parcelId: z.uuid() }).strict();

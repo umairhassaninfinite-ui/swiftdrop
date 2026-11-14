@@ -47,6 +47,9 @@ model User {
   sessions     AuthSession[]
   verificationTokens VerificationToken[]
   passwordResetTokens PasswordResetToken[]
+  mfaFactor MfaFactor?
+  mfaRecoveryCodes MfaRecoveryCode[]
+  mfaChallenges MfaChallenge[]
   staffInvitations StaffInvitation[]
   oauthTransactions OAuthTransaction[]
   quotes Quote[]
@@ -120,6 +123,65 @@ model PasswordResetToken {
   @@index([userId, generation])
   @@index([expiresAt])
   @@map("password_reset_tokens")
+}
+
+// Security trail (auth plan section 6). The user ids are plain integers, not foreign keys, so
+// deleting an account never deletes the record of what happened to it. Metadata is a small,
+// whitelisted set of primitives (see apps/core-api/src/modules/auth/audit.ts); never secrets.
+model AuthAuditEvent {
+  id            String   @id @default(uuid()) @db.Uuid
+  occurredAt    DateTime @default(now()) @map("occurred_at") @db.Timestamptz(3)
+  eventType     String   @map("event_type") @db.VarChar(40)
+  outcome       String   @db.VarChar(8)
+  actorUserId   Int?     @map("actor_user_id")
+  targetUserId  Int?     @map("target_user_id")
+  correlationId String?  @map("correlation_id") @db.VarChar(64)
+  metadata      Json     @default("{}")
+  @@index([occurredAt])
+  @@index([targetUserId, occurredAt])
+  @@index([eventType, occurredAt])
+  @@map("auth_audit_events")
+}
+
+// One TOTP factor per user. The secret is AES-256-GCM encrypted under a dedicated key
+// (key_version names it, so the key can be rotated); a factor is usable only once confirmed.
+// last_used_step is the newest accepted 30 second time step: a code can never be replayed.
+model MfaFactor {
+  id              String    @id @default(uuid()) @db.Uuid
+  userId          Int       @unique @map("user_id")
+  user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  encryptedSecret String    @map("encrypted_secret") @db.Text
+  keyVersion      Int       @map("key_version")
+  confirmedAt     DateTime? @map("confirmed_at") @db.Timestamptz(3)
+  lastUsedStep    BigInt?   @map("last_used_step")
+  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  @@map("mfa_factors")
+}
+
+model MfaRecoveryCode {
+  id        String    @id @default(uuid()) @db.Uuid
+  userId    Int       @map("user_id")
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  codeHash  String    @unique @map("code_hash") @db.Char(64)
+  usedAt    DateTime? @map("used_at") @db.Timestamptz(3)
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  @@index([userId])
+  @@map("mfa_recovery_codes")
+}
+
+// Opaque, short-lived step between the password and the second factor. It carries no access.
+model MfaChallenge {
+  id         String    @id @default(uuid()) @db.Uuid
+  userId     Int       @map("user_id")
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash  String    @unique @map("token_hash") @db.Char(64)
+  expiresAt  DateTime  @map("expires_at") @db.Timestamptz(3)
+  attempts   Int       @default(0)
+  consumedAt DateTime? @map("consumed_at") @db.Timestamptz(3)
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  @@index([expiresAt])
+  @@index([userId])
+  @@map("mfa_challenges")
 }
 
 model StaffInvitation {
@@ -506,6 +568,8 @@ model AuthSession {
   absoluteExpiresAt DateTime @map("absolute_expires_at") @db.Timestamptz(3)
   revokedAt         DateTime? @map("revoked_at") @db.Timestamptz(3)
   revocationReason  String? @map("revocation_reason") @db.VarChar(32)
+  reauthenticatedAt DateTime? @map("reauthenticated_at") @db.Timestamptz(3)
+  mfaVerifiedAt     DateTime? @map("mfa_verified_at") @db.Timestamptz(3)
   refreshTokens     RefreshToken[]
   accessGrants      AccessGrant[]
   @@index([userId, revokedAt])

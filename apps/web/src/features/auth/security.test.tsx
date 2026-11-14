@@ -96,6 +96,7 @@ describe("active sessions", () => {
   it("lists sessions and labels this device", async () => {
     vi.mocked(listSessions).mockResolvedValue({
       items: [item(ID_HERE, true), item(ID_OTHER, false)],
+      nextCursor: null,
     });
     render(<ActiveSessions reloadKey={0} />);
     expect(await screen.findByText("This device")).toBeInTheDocument();
@@ -105,8 +106,11 @@ describe("active sessions", () => {
 
   it("revokes another device and refreshes the list without signing out here", async () => {
     vi.mocked(listSessions)
-      .mockResolvedValueOnce({ items: [item(ID_HERE, true), item(ID_OTHER, false)] })
-      .mockResolvedValueOnce({ items: [item(ID_HERE, true)] });
+      .mockResolvedValueOnce({
+        items: [item(ID_HERE, true), item(ID_OTHER, false)],
+        nextCursor: null,
+      })
+      .mockResolvedValueOnce({ items: [item(ID_HERE, true)], nextCursor: null });
     vi.mocked(revokeSession).mockResolvedValue(undefined);
     render(<ActiveSessions reloadKey={0} />);
     const user = userEvent.setup();
@@ -121,7 +125,10 @@ describe("active sessions", () => {
   });
 
   it("signs this browser out when its own session is revoked", async () => {
-    vi.mocked(listSessions).mockResolvedValue({ items: [item(ID_HERE, true)] });
+    vi.mocked(listSessions).mockResolvedValue({
+      items: [item(ID_HERE, true)],
+      nextCursor: null,
+    });
     vi.mocked(revokeSession).mockResolvedValue(undefined);
     render(<ActiveSessions reloadKey={0} />);
     const user = userEvent.setup();
@@ -132,7 +139,10 @@ describe("active sessions", () => {
 
   it("does nothing when the confirmation is declined", async () => {
     vi.mocked(window.confirm).mockReturnValue(false);
-    vi.mocked(listSessions).mockResolvedValue({ items: [item(ID_OTHER, false)] });
+    vi.mocked(listSessions).mockResolvedValue({
+      items: [item(ID_OTHER, false)],
+      nextCursor: null,
+    });
     render(<ActiveSessions reloadKey={0} />);
     const user = userEvent.setup();
     await user.click(await screen.findByRole("button", { name: "Sign out" }));
@@ -140,7 +150,10 @@ describe("active sessions", () => {
   });
 
   it("reports a failed revoke and keeps the list", async () => {
-    vi.mocked(listSessions).mockResolvedValue({ items: [item(ID_OTHER, false)] });
+    vi.mocked(listSessions).mockResolvedValue({
+      items: [item(ID_OTHER, false)],
+      nextCursor: null,
+    });
     vi.mocked(revokeSession).mockRejectedValue(new Error("Session not found."));
     render(<ActiveSessions reloadKey={0} />);
     const user = userEvent.setup();
@@ -154,5 +167,24 @@ describe("active sessions", () => {
     render(<ActiveSessions reloadKey={0} />);
     expect(await screen.findByRole("alert")).toHaveTextContent("Cannot reach SwiftDrop.");
     expect(screen.queryByText("No other active sessions.")).not.toBeInTheDocument();
+  });
+});
+
+describe("active sessions pagination", () => {
+  it("loads further pages on request and appends them", async () => {
+    vi.mocked(listSessions)
+      .mockResolvedValueOnce({ items: [item(ID_HERE, true)], nextCursor: "cursor-2" })
+      .mockResolvedValueOnce({ items: [item(ID_OTHER, false)], nextCursor: null });
+    render(<ActiveSessions reloadKey={0} />);
+    const user = userEvent.setup();
+    await screen.findByText("This device");
+    expect(screen.queryByText("Another device")).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Show more sessions" }));
+    expect(await screen.findByText("Another device")).toBeInTheDocument();
+    expect(screen.getByText("This device")).toBeInTheDocument();
+    expect(listSessions).toHaveBeenLastCalledWith("cursor-2");
+    expect(
+      screen.queryByRole("button", { name: "Show more sessions" }),
+    ).not.toBeInTheDocument();
   });
 });

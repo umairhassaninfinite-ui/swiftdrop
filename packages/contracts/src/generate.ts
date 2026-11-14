@@ -19,6 +19,17 @@ import {
   resetPasswordSchema,
   changePasswordSchema,
   sessionListSchema,
+  sessionListQuerySchema,
+  loginResultSchema,
+  mfaChallengeVerifySchema,
+  mfaChallengeRecoverSchema,
+  mfaEnrolResultSchema,
+  mfaConfirmSchema,
+  mfaRecoveryCodesSchema,
+  mfaStatusSchema,
+  reauthenticateSchema,
+  reauthenticateResultSchema,
+  auditPageSchema,
   completeProfileSchema,
   googleLinkSchema,
   quoteRequestSchema,
@@ -273,7 +284,36 @@ for (const [method, suffix, input, output, status, bearer] of [
     200,
     true,
   ],
-  ["post", "login", loginSchema, sessionSchema, 200, false],
+  ["post", "login", loginSchema, loginResultSchema, 200, false],
+  [
+    "post",
+    "mfa/challenge/verify",
+    mfaChallengeVerifySchema,
+    sessionSchema,
+    200,
+    false,
+  ],
+  [
+    "post",
+    "mfa/challenge/recover",
+    mfaChallengeRecoverSchema,
+    sessionSchema,
+    200,
+    false,
+  ],
+  ["get", "mfa", null, mfaStatusSchema, 200, true],
+  ["post", "mfa/enrol", emptySchema, mfaEnrolResultSchema, 200, true],
+  ["post", "mfa/confirm", mfaConfirmSchema, mfaRecoveryCodesSchema, 200, true],
+  ["post", "mfa/recovery-codes", emptySchema, mfaRecoveryCodesSchema, 200, true],
+  ["delete", "mfa", null, null, 204, true],
+  [
+    "post",
+    "reauthenticate",
+    reauthenticateSchema,
+    reauthenticateResultSchema,
+    200,
+    true,
+  ],
   ["post", "refresh", emptySchema, sessionSchema, 200, false],
   ["post", "logout", emptySchema, null, 204, false],
   ["post", "logout-all", emptySchema, null, 204, true],
@@ -291,7 +331,9 @@ for (const [method, suffix, input, output, status, bearer] of [
           : [],
     ...(input
       ? { request: { body: { required: true, content: json(input) } } }
-      : {}),
+      : suffix === "sessions"
+        ? { request: { query: sessionListQuerySchema } }
+        : {}),
     responses: {
       [status]: {
         description: "Success",
@@ -396,6 +438,7 @@ for (const [method, path, input, output, status, bearer] of [
   ["patch", "/api/v1/admin/zones/{id}", zoneInputSchema, zoneSchema, 200, true],
   ["delete", "/api/v1/admin/zones/{id}", null, null, 204, true],
   ["delete", "/api/v1/auth/sessions/{id}", null, null, 204, true],
+  ["get", "/api/v1/admin/audit-events", null, auditPageSchema, 200, true],
   ["get", "/api/v1/admin/pricing", null, z.array(priceSchema), 200, true],
   ["post", "/api/v1/admin/pricing", priceInputSchema, priceSchema, 201, true],
   [
@@ -443,6 +486,18 @@ for (const [method, path, input, output, status, bearer] of [
                 ]
               : []),
           ],
+        }
+      : {}),
+    ...(method === "get" && path === "/api/v1/admin/audit-events"
+      ? {
+          parameters: ["cursor", "limit", "eventType", "userId"].map(
+            (name) => ({
+              name,
+              in: "query" as const,
+              required: false,
+              schema: { type: "string" as const },
+            }),
+          ),
         }
       : {}),
     ...(method === "get" && path === "/api/v1/parcels"

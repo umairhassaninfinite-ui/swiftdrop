@@ -7,6 +7,7 @@ import {
   revokeSession,
 } from "./client.js";
 import { useSession } from "./session.js";
+export { MfaSettings } from "./mfa.js";
 
 const when = (iso: string) => new Date(iso).toLocaleString();
 
@@ -58,9 +59,6 @@ export function ChangePasswordForm({ onChanged }: { onChanged: () => void }) {
   return (
     <form onSubmit={submit} noValidate aria-labelledby="change-password-title">
       <h2 id="change-password-title">Change password</h2>
-      <p className="muted">
-        Accounts that only sign in with Google have no password to change.
-      </p>
       <label htmlFor="current-password">Current password</label>
       <input
         id="current-password"
@@ -109,21 +107,35 @@ export function ChangePasswordForm({ onChanged }: { onChanged: () => void }) {
 export function ActiveSessions({ reloadKey }: { reloadKey: number }) {
   const { clear } = useSession();
   const [items, setItems] = useState<SessionSummary[] | null>(null);
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState<string | null>(null);
+  const [loadingMore, setLoadingMore] = useState(false);
 
-  const load = useCallback(async () => {
+  /** First page replaces the list (initial load, after a change); a cursor appends the next. */
+  const load = useCallback(async (cursor?: string) => {
     setError("");
     try {
-      setItems((await listSessions()).items);
+      const page = await listSessions(cursor);
+      setItems((previous) =>
+        cursor && previous ? [...previous, ...page.items] : page.items,
+      );
+      setNextCursor(page.nextCursor);
     } catch (cause) {
       setError(errorMessage(cause));
-      setItems([]);
+      setItems((previous) => previous ?? []);
     }
   }, []);
   useEffect(() => {
     void load();
   }, [load, reloadKey]);
+
+  async function more() {
+    if (!nextCursor || loadingMore) return;
+    setLoadingMore(true);
+    await load(nextCursor);
+    setLoadingMore(false);
+  }
 
   async function revoke(item: SessionSummary) {
     if (busy) return;
@@ -177,6 +189,16 @@ export function ActiveSessions({ reloadKey }: { reloadKey: number }) {
             </li>
           ))}
         </ul>
+      )}
+      {nextCursor && (
+        <button
+          type="button"
+          className="secondary"
+          disabled={loadingMore}
+          onClick={() => void more()}
+        >
+          {loadingMore ? "Loading…" : "Show more sessions"}
+        </button>
       )}
       <p role="alert" aria-live="polite" className={error ? "notice error" : undefined}>
         {error}

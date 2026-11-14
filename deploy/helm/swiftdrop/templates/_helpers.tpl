@@ -51,6 +51,10 @@
   value: /run/swiftdrop/auth/rate-limit.key
 - name: OAUTH_TRANSACTION_SECRET_FILE
   value: /run/swiftdrop/auth/oauth.key
+- name: MFA_SECRET_FILE
+  value: /run/swiftdrop/auth/mfa.key
+- name: MFA_REQUIRED_ROLES
+  value: {{ .Values.auth.mfaRequiredRoles | default "" | quote }}
 - name: OUTBOX_RELAY_URL
   value: http://outbox-relay:{{ .Values.outboxRelay.port }}
 {{- end -}}

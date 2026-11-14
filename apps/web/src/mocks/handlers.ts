@@ -50,7 +50,7 @@ export const mockPrices = [
 export const mockParcels = [
   {
     id: "22222222-2222-4222-8222-222222222222",
-    trackingNumber: "SD1234567A",
+    trackingNumber: "SD-7KQ2M9XA-Y",
     status: "IN_TRANSIT" as const,
     feeCents: 57000,
     currency: "LKR" as const,
@@ -266,6 +266,41 @@ export const handlers = [
     () => new HttpResponse(null, { status: 204 }),
   ),
 
+  http.get("/api/v1/auth/mfa", () =>
+    HttpResponse.json({
+      enabled: false,
+      pendingEnrolment: false,
+      recoveryCodesRemaining: 0,
+      required: false,
+    }),
+  ),
+
+  http.post("/api/v1/auth/mfa/enrol", () =>
+    HttpResponse.json({
+      secret: "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP",
+      otpauthUri:
+        "otpauth://totp/SwiftDrop:mock%40example.test?secret=JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP&issuer=SwiftDrop",
+    }),
+  ),
+
+  http.post("/api/v1/auth/mfa/confirm", () =>
+    HttpResponse.json({
+      recoveryCodes: Array.from({ length: 10 }, (_, i) => `MOCK${i}-ABCDE`),
+    }),
+  ),
+
+  http.post("/api/v1/auth/mfa/recovery-codes", () =>
+    HttpResponse.json({
+      recoveryCodes: Array.from({ length: 10 }, (_, i) => `NEW${i}K-FGHJK`),
+    }),
+  ),
+
+  http.delete("/api/v1/auth/mfa", () => new HttpResponse(null, { status: 204 })),
+
+  http.post("/api/v1/auth/reauthenticate", () =>
+    HttpResponse.json({ reauthenticatedAt: new Date().toISOString() }),
+  ),
+
   http.post("/api/v1/auth/complete-profile", async ({ request }) => {
     const body = (await request.json()) as Record<string, string>;
     return HttpResponse.json({
@@ -313,7 +348,7 @@ export const handlers = [
     const newParcel = {
       ...mockParcels[0]!,
       id: "44444444-4444-4444-8444-444444444444",
-      trackingNumber: "SD1234567A",
+      trackingNumber: "SD-7KQ2M9XA-Y",
       recipientName: (body["recipientName"] as string) || "Recipient",
       recipientPhone: (body["recipientPhone"] as string) || "+94771234567",
       recipientAddress: (body["recipientAddress"] as string) || "Address",
@@ -337,7 +372,7 @@ export const handlers = [
 
   http.get("/api/v1/parcels/:id/receipt", () => {
     return HttpResponse.json({
-      receiptReference: "SDR-SD1234567A",
+      receiptReference: "SDR-SD-7KQ2M9XA-Y",
       downloadUrl: "http://localhost:5173/receipt.pdf",
       expiresAt: new Date(Date.now() + 3600000).toISOString(),
     });
@@ -486,7 +521,7 @@ export const handlers = [
       items: [
         {
           id: "33333333-3333-4333-8333-333333333333",
-          trackingNumber: "SD-MOCK0001-X",
+          trackingNumber: "SD-4HNP6RTD-N",
           status: "CREATED",
           version: 1,
           attemptCount: 0,
@@ -538,7 +573,7 @@ export const handlers = [
       items: [
         {
           id: "33333333-3333-4333-8333-333333333333",
-          trackingNumber: "SD-MOCK0001-X",
+          trackingNumber: "SD-4HNP6RTD-N",
           status: "OUT_FOR_DELIVERY",
           version: 4,
           attemptCount: 1,

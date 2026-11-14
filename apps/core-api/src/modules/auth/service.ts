@@ -26,6 +26,9 @@ import { checkPassword } from "./password.js";
 import * as oidc from "openid-client";
 import type { Logger } from "pino";
 import { revokeUserSessions } from "./transactions.js";
+import { recordAudit, tryRecordAudit } from "./audit.js";
+import type { MfaService } from "./mfa.js";
+import { MFA_CHALLENGE_SECONDS } from "@swiftdrop/contracts";
 export const tokenHash = (token: string) =>
   createHash("sha256").update(token).digest("hex");
 export const validRefresh = (token: unknown): token is string =>
@@ -61,10 +64,13 @@ export class AuthService {
       | "GOOGLE_CLIENT_SECRET"
       | "GOOGLE_CALLBACK_URL"
       | "oauthSecret"
+      | "RECENT_AUTH_SECONDS"
+      | "MFA_REQUIRED_ROLES"
     >,
     private mailer?: AuthMailer,
     private google = new GoogleOidc(config),
     private logger?: Pick<Logger, "warn">,
+    readonly mfa?: MfaService,
   ) {}
   private async lockUser(tx: Tx, id: number) {
     await tx.$queryRaw`SELECT id FROM users WHERE id = ${id} FOR UPDATE`;
@@ -528,13 +534,20 @@ export class AuthService {
     };
   }
   /** A new session family with its first credentials; the caller holds the user lock. */
-  private async startSession(tx: Tx, user: User) {
+  private async startSession(
+    tx: Tx,
+    user: User,
+    assurance: { mfaVerifiedAt?: Date } = {},
+  ) {
     const now = Date.now();
     const limits = this.limits(user.roleId);
     const family = await tx.authSession.create({
       data: {
         userId: user.id,
         roleAtAuthentication: user.roleId,
+        ...(assurance.mfaVerifiedAt
+          ? { mfaVerifiedAt: assurance.mfaVerifiedAt }
+          : {}),
         idleExpiresAt: new Date(
           now + Math.min(limits.idle, limits.absolute) * 1000,
         ),
@@ -543,14 +556,32 @@ export class AuthService {
     });
     return this.credentials(tx, user, family);
   }
-  async login(email: string, password: string) {
+  /**
+   * Password step of sign-in. An account with a confirmed second factor gets an opaque
+   * five-minute challenge and no session, cookie or token; everyone else gets a session.
+   */
+  async beginLogin(
+    email: string,
+    password: string,
+  ): Promise<Credentials | { challengeToken: string }> {
     const candidate = await this.db.user.findUnique({ where: { email } });
     if (
       !(await checkPassword(password, candidate?.passwordHash)) ||
       !candidate ||
       candidate.status !== "ACTIVE"
-    )
+    ) {
+      await tryRecordAudit(
+        this.db,
+        {
+          type: "LOGIN",
+          outcome: "FAILURE",
+          targetId: candidate?.id ?? null,
+          metadata: { method: "password", reason: "credentials" },
+        },
+        () => this.logger?.warn({ event: "audit_write_failed" }),
+      );
       throw unauthorised();
+    }
     const result = await this.db.$transaction(async (tx) => {
       await this.lockUser(tx, candidate.id);
       const user = await tx.user.findUnique({ where: { id: candidate.id } });
@@ -561,10 +592,249 @@ export class AuthService {
         user.roleId !== candidate.roleId
       )
         return null;
-      return this.startSession(tx, user);
+      if (this.mfa && (await this.mfa.hasFactor(user.id, tx))) {
+        const challengeToken = randomBytes(32).toString("base64url");
+        // One open challenge per account: a new password step replaces the previous one.
+        await tx.mfaChallenge.deleteMany({
+          where: { userId: user.id, consumedAt: null },
+        });
+        await tx.mfaChallenge.create({
+          data: {
+            userId: user.id,
+            tokenHash: tokenHash(challengeToken),
+            expiresAt: new Date(Date.now() + MFA_CHALLENGE_SECONDS * 1000),
+          },
+        });
+        return { challengeToken };
+      }
+      const credentials = await this.startSession(tx, user);
+      await recordAudit(tx, {
+        type: "LOGIN",
+        outcome: "SUCCESS",
+        actorId: user.id,
+        targetId: user.id,
+        metadata: { method: "password" },
+      });
+      return credentials;
     });
     if (!result) throw unauthorised();
     return result;
+  }
+  /** Sign-in for callers that cannot handle a challenge (tests, tooling). */
+  async login(email: string, password: string) {
+    const result = await this.beginLogin(email, password);
+    if ("challengeToken" in result)
+      throw new HttpError(
+        409,
+        "MFA_REQUIRED",
+        "This account requires its second factor to sign in.",
+      );
+    return result;
+  }
+
+  /** Second step: a 6 digit code (or, below, a recovery code) turns a challenge into a session. */
+  verifyMfaChallenge(challengeToken: string, code: string) {
+    return this.completeChallenge(challengeToken, "totp", (tx, userId) =>
+      this.mfa!.verifyCode(userId, code, tx),
+    );
+  }
+  recoverMfaChallenge(challengeToken: string, recoveryCode: string) {
+    return this.completeChallenge(challengeToken, "recovery", (tx, userId) =>
+      this.mfa!.consumeRecoveryCode(userId, recoveryCode, tx),
+    );
+  }
+  private async completeChallenge(
+    rawToken: string,
+    method: "totp" | "recovery",
+    proof: (tx: Tx, userId: number) => Promise<boolean>,
+  ) {
+    const invalid = () =>
+      new HttpError(
+        401,
+        "MFA_CHALLENGE_INVALID",
+        "The code is incorrect or the sign-in expired. Sign in again.",
+      );
+    if (!this.mfa) throw invalid();
+    const hash = tokenHash(rawToken);
+    const known = await this.db.mfaChallenge.findUnique({
+      where: { tokenHash: hash },
+    });
+    if (!known) throw invalid();
+    const MAX_ATTEMPTS = 5;
+    const outcome = await this.db.$transaction(async (tx) => {
+      await this.lockUser(tx, known.userId);
+      const challenge = await tx.mfaChallenge.findUnique({
+        where: { tokenHash: hash },
+      });
+      const user = await tx.user.findUnique({ where: { id: known.userId } });
+      const now = new Date();
+      if (
+        !challenge ||
+        !user ||
+        challenge.consumedAt ||
+        challenge.expiresAt <= now ||
+        challenge.attempts >= MAX_ATTEMPTS ||
+        user.status !== "ACTIVE"
+      )
+        return "invalid" as const;
+      if (!(await proof(tx, user.id))) {
+        // The failed attempt is counted and committed; the error is thrown after the commit.
+        await tx.mfaChallenge.update({
+          where: { id: challenge.id },
+          data: { attempts: { increment: 1 } },
+        });
+        await recordAudit(tx, {
+          type: "MFA_CHALLENGE",
+          outcome: "FAILURE",
+          targetId: user.id,
+          metadata: { method },
+        });
+        return "wrong" as const;
+      }
+      await tx.mfaChallenge.update({
+        where: { id: challenge.id },
+        data: { consumedAt: now },
+      });
+      const credentials = await this.startSession(tx, user, {
+        mfaVerifiedAt: now,
+      });
+      await recordAudit(tx, {
+        type: "LOGIN",
+        outcome: "SUCCESS",
+        actorId: user.id,
+        targetId: user.id,
+        metadata: { method },
+      });
+      if (method === "recovery")
+        await recordAudit(tx, {
+          type: "MFA_RECOVERY_CODE_USED",
+          outcome: "SUCCESS",
+          actorId: user.id,
+          targetId: user.id,
+          metadata: {
+            remaining: await tx.mfaRecoveryCode.count({
+              where: { userId: user.id, usedAt: null },
+            }),
+          },
+        });
+      return credentials;
+    });
+    if (outcome === "invalid" || outcome === "wrong") throw invalid();
+    return outcome;
+  }
+
+  /**
+   * Fresh proof for a sensitive action: the current password and, when a second factor is
+   * enabled, a current code. The proof is recorded on the session family on the server; refresh
+   * never touches it, so a stolen refresh cookie cannot pass for recent proof.
+   */
+  async reauthenticate(
+    userId: number,
+    familyId: string,
+    password: string,
+    code?: string,
+  ) {
+    const failed = new HttpError(
+      400,
+      "REAUTH_FAILED",
+      "The password or code is incorrect.",
+    );
+    const user = await this.db.user.findUnique({ where: { id: userId } });
+    const passwordOk =
+      (await checkPassword(password, user?.passwordHash)) &&
+      user?.status === "ACTIVE";
+    const hasFactor = Boolean(this.mfa && (await this.mfa.hasFactor(userId)));
+    if (passwordOk && hasFactor && !code)
+      throw new HttpError(
+        400,
+        "MFA_CODE_REQUIRED",
+        "Enter the 6 digit code from your authenticator app.",
+      );
+    const codeOk =
+      !hasFactor || (passwordOk && (await this.mfa!.verifyCode(userId, code!)));
+    if (!passwordOk || !codeOk) {
+      await tryRecordAudit(
+        this.db,
+        {
+          type: "REAUTHENTICATE",
+          outcome: "FAILURE",
+          actorId: userId,
+          targetId: userId,
+          metadata: { reason: passwordOk ? "code" : "password" },
+        },
+        () => this.logger?.warn({ event: "audit_write_failed" }),
+      );
+      throw failed;
+    }
+    const now = new Date();
+    await this.db.$transaction(async (tx) => {
+      const updated = await tx.authSession.updateMany({
+        where: { id: familyId, userId, revokedAt: null },
+        data: {
+          reauthenticatedAt: now,
+          ...(hasFactor ? { mfaVerifiedAt: now } : {}),
+        },
+      });
+      if (updated.count !== 1) throw unauthorised();
+      await recordAudit(tx, {
+        type: "REAUTHENTICATE",
+        outcome: "SUCCESS",
+        actorId: userId,
+        targetId: userId,
+      });
+    });
+    return now;
+  }
+
+  /** Marks the current session as having just proved its second factor (after enrolment). */
+  async markMfaVerified(familyId: string) {
+    const now = new Date();
+    await this.db.authSession.updateMany({
+      where: { id: familyId, revokedAt: null },
+      data: { mfaVerifiedAt: now },
+    });
+  }
+
+  /**
+   * Throws 403 REAUTH_REQUIRED unless this session proved its password within
+   * RECENT_AUTH_SECONDS and, with `mfa` and an enabled factor, its code as well.
+   */
+  async assertRecentAuth(
+    userId: number,
+    familyId: string,
+    options: { mfa?: boolean } = {},
+  ) {
+    const session = await this.db.authSession.findUnique({
+      where: { id: familyId },
+    });
+    if (!session || session.userId !== userId || session.revokedAt)
+      throw unauthorised();
+    const windowMs = this.config.RECENT_AUTH_SECONDS * 1000;
+    const now = Date.now();
+    const proved = Math.max(
+      session.authenticatedAt.getTime(),
+      session.reauthenticatedAt?.getTime() ?? 0,
+    );
+    let recent = now - proved <= windowMs;
+    if (recent && options.mfa && this.mfa && (await this.mfa.hasFactor(userId)))
+      recent =
+        session.mfaVerifiedAt !== null &&
+        now - session.mfaVerifiedAt.getTime() <= windowMs;
+    if (!recent)
+      throw new HttpError(
+        403,
+        "REAUTH_REQUIRED",
+        "Confirm your password to continue.",
+      );
+  }
+
+  /** True when the role must have a second factor and this account has none yet. */
+  async mfaEnrolmentRequired(userId: number, role: Role) {
+    return Boolean(
+      this.mfa &&
+        this.config.MFA_REQUIRED_ROLES.includes(role) &&
+        !(await this.mfa.hasFactor(userId)),
+    );
   }
   private async revoke(tx: Tx, familyId: string, reason: string) {
     await tx.authSession.updateMany({
@@ -604,6 +874,12 @@ export class AuthService {
       const family = token.family;
       if (token.consumedAt) {
         await this.revoke(tx, family.id, "refresh_reuse");
+        await recordAudit(tx, {
+          type: "REFRESH_REUSE",
+          outcome: "FAILURE",
+          targetId: family.userId,
+          metadata: { reason: "consumed_token_presented" },
+        });
         return null;
       }
       const now = new Date();
@@ -650,36 +926,40 @@ export class AuthService {
     await this.db.$transaction(async (tx) => {
       await this.lockUser(tx, token.family.userId);
       await this.revoke(tx, token.familyId, "logout");
+      await recordAudit(tx, {
+        type: "LOGOUT",
+        outcome: "SUCCESS",
+        actorId: token.family.userId,
+        targetId: token.family.userId,
+      });
     });
   }
   async revokeAll(userId: number) {
     await this.db.$transaction(async (tx) => {
       await this.lockUser(tx, userId);
       await revokeUserSessions(tx, userId, "logout_all");
+      await recordAudit(tx, {
+        type: "LOGOUT_ALL",
+        outcome: "SUCCESS",
+        actorId: userId,
+        targetId: userId,
+      });
     });
   }
   // ---- Password recovery and session management (auth plan 4.3, 4.5, section 7) ----
 
   /**
    * Always accepted, never reveals whether the address exists. Only an active account with a
-   * local password gets a reset link; a Google-only account gets sign-in guidance; suspended,
-   * invited and unknown addresses get nothing. Mail is sent after the token commits and is not
-   * awaited, so response time does not depend on whether an address is registered.
+   * local password gets a reset link; suspended, invited, passwordless and unknown addresses
+   * get nothing. Mail is sent after the token commits and is not awaited, so response time does
+   * not depend on whether an address is registered.
    */
   async requestPasswordReset(email: string) {
     if (!this.mailer?.sendPasswordReset) return;
     const user = await this.db.user.findUnique({ where: { email } });
     if (!user || user.status !== "ACTIVE") return;
-    if (!user.passwordHash) {
-      if (user.googleSub && this.mailer.sendPasswordResetUnavailable)
-        this.deliver(
-          this.mailer.sendPasswordResetUnavailable(
-            user.email,
-            `${this.config.APP_ORIGIN}/auth/login`,
-          ),
-        );
-      return;
-    }
+    // No local password to reset (Google sign-in only): same silence as an unknown address.
+    if (!user.passwordHash) return;
     const raw = randomBytes(32).toString("base64url");
     const issued = await this.db.$transaction(async (tx) => {
       await this.lockUser(tx, user.id);
@@ -705,6 +985,11 @@ export class AuthService {
           generation: (latest?.generation ?? 0) + 1,
           expiresAt: new Date(Date.now() + 30 * 60 * 1000),
         },
+      });
+      await recordAudit(tx, {
+        type: "PASSWORD_RESET_REQUESTED",
+        outcome: "SUCCESS",
+        targetId: user.id,
       });
       return true;
     });
@@ -768,6 +1053,11 @@ export class AuthService {
       });
       await tx.user.update({ where: { id: user.id }, data: { passwordHash } });
       await revokeUserSessions(tx, user.id, "password_reset", now);
+      await recordAudit(tx, {
+        type: "PASSWORD_RESET",
+        outcome: "SUCCESS",
+        targetId: user.id,
+      });
       return true;
     });
     if (!done) throw invalid();
@@ -787,12 +1077,24 @@ export class AuthService {
       !(await checkPassword(currentPassword, candidate?.passwordHash)) ||
       !candidate ||
       candidate.status !== "ACTIVE"
-    )
+    ) {
+      await tryRecordAudit(
+        this.db,
+        {
+          type: "PASSWORD_CHANGE",
+          outcome: "FAILURE",
+          actorId: userId,
+          targetId: userId,
+          metadata: { reason: "current_password" },
+        },
+        () => this.logger?.warn({ event: "audit_write_failed" }),
+      );
       throw new HttpError(
         400,
         "CURRENT_PASSWORD_INCORRECT",
         "The current password is incorrect.",
       );
+    }
     if (currentPassword === newPassword)
       throw new HttpError(
         400,
@@ -820,6 +1122,12 @@ export class AuthService {
         data: { revokedAt: now },
       });
       await revokeUserSessions(tx, userId, "password_change", now);
+      await recordAudit(tx, {
+        type: "PASSWORD_CHANGE",
+        outcome: "SUCCESS",
+        actorId: userId,
+        targetId: userId,
+      });
       return this.startSession(tx, updated);
     });
     if (!result)
@@ -831,21 +1139,56 @@ export class AuthService {
     return result;
   }
 
-  /** The caller's own live sessions: ids and times only, never tokens or network details. */
-  async listSessions(userId: number, currentFamilyId: string) {
+  /**
+   * The caller's own live sessions, most recently active first, as a cursor page: ids and times
+   * only, never tokens or network details. The cursor encodes (last activity, id), the same
+   * keys as the ordering, so a page is stable while sessions come and go.
+   */
+  async listSessions(
+    userId: number,
+    currentFamilyId: string,
+    page: { cursor?: string | undefined; limit?: number } = {},
+  ) {
     const now = new Date();
+    const limit = Math.min(Math.max(page.limit ?? 20, 1), 50);
+    let after: { at: Date; id: string } | undefined;
+    if (page.cursor) {
+      const [time, id] = Buffer.from(page.cursor, "base64url")
+        .toString("utf8")
+        .split("|");
+      const at = new Date(time ?? "");
+      if (Number.isNaN(at.getTime()) || !id || !/^[0-9a-f-]{36}$/i.test(id))
+        throw new HttpError(400, "CURSOR", "The page cursor is invalid.");
+      after = { at, id };
+    }
     const rows = await this.db.authSession.findMany({
       where: {
         userId,
         revokedAt: null,
         idleExpiresAt: { gt: now },
         absoluteExpiresAt: { gt: now },
+        ...(after
+          ? {
+              OR: [
+                { lastRefreshedAt: { lt: after.at } },
+                { lastRefreshedAt: after.at, id: { gt: after.id } },
+              ],
+            }
+          : {}),
       },
       orderBy: [{ lastRefreshedAt: "desc" }, { id: "asc" }],
-      take: 50,
+      take: limit + 1,
     });
+    const visible = rows.slice(0, limit);
+    const last = visible.at(-1);
     return {
-      items: rows.map((row) => ({
+      nextCursor:
+        rows.length > limit && last
+          ? Buffer.from(
+              `${last.lastRefreshedAt.toISOString()}|${last.id}`,
+            ).toString("base64url")
+          : null,
+      items: visible.map((row) => ({
         id: row.id,
         authenticatedAt: row.authenticatedAt.toISOString(),
         lastRefreshedAt: row.lastRefreshedAt.toISOString(),
@@ -867,9 +1210,15 @@ export class AuthService {
         where: { id, userId, revokedAt: null },
         data: { revokedAt: new Date(), revocationReason: "session_revoked" },
       });
-      if (changed.count === 1)
+      if (changed.count === 1) {
         await tx.accessGrant.deleteMany({ where: { familyId: id } });
-      else if (
+        await recordAudit(tx, {
+          type: "SESSION_REVOKED",
+          outcome: "SUCCESS",
+          actorId: userId,
+          targetId: userId,
+        });
+      } else if (
         !(await tx.authSession.findFirst({
           where: { id, userId },
           select: { id: true },

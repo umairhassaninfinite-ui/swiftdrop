@@ -1,4 +1,4 @@
-import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { Prisma, type Database } from "@swiftdrop/db";
 import type {
   bookingRequestSchema,
@@ -10,22 +10,15 @@ import type {
   priceInputSchema,
 } from "@swiftdrop/contracts";
 import { ROUTING_KEYS } from "@swiftdrop/contracts";
+import { generateTrackingNumber as trackingNumber } from "./tracking.js";
 import { HttpError } from "../../shared/problem.js";
 import { outbox } from "../../shared/outbox/index.js";
 import type { z } from "zod";
 import { PricingService } from "../pricing/index.js";
 
-const ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 const requestHash = (body: unknown) =>
   createHash("sha256").update(JSON.stringify(body)).digest("hex");
 const iso = (date: Date) => date.toISOString();
-const trackingNumber = () => {
-  const seed = randomBytes(7).toString("hex").toUpperCase().slice(0, 7);
-  const check =
-    [...seed].reduce((sum, ch) => sum + ALPHABET.indexOf(ch), 0) %
-    ALPHABET.length;
-  return `SD${seed}${ALPHABET[check]}`;
-};
 const publicParcel = (
   parcel: Prisma.ParcelGetPayload<{ include: typeof parcelInclude }>,
 ) => ({

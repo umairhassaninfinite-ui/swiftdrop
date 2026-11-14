@@ -1,3 +1,6 @@
+import { isValidTrackingNumber } from "@swiftdrop/contracts";
+import { totpAt } from "../src/modules/auth/totp.js";
+import { cleanupAuth } from "../src/modules/auth/index.js";
 import {
   beforeAll,
   afterAll,
@@ -24,7 +27,6 @@ import { isSwiftDropEvent, ROUTING_KEYS } from "@swiftdrop/contracts";
 import { createApp } from "../src/app.js";
 import { createInternalApp } from "../src/internal-app.js";
 import { signServiceEventToken } from "../src/modules/services/signing.js";
-import { cleanupAuth } from "../src/modules/auth/index.js";
 import { createTokenService } from "../src/modules/auth/jwt.js";
 import { tokenHash } from "../src/modules/auth/service.js";
 import type { GoogleOidc } from "../src/modules/auth/google.js";
@@ -58,7 +60,6 @@ let hash: string;
 let verificationLink = "";
 let invitationLink = "";
 let resetLinks: string[] = [];
-let guidanceTo: string[] = [];
 let mailFailure = false;
 let googleIdentityEmail = "google@example.test";
 async function user(role: RoleName = "CUSTOMER", email = input.email) {
@@ -169,7 +170,13 @@ beforeAll(async () => {
     CSRF_SECRET_FILE: "",
     RATE_LIMIT_SECRET_FILE: "",
     OAUTH_TRANSACTION_SECRET_FILE: "",
+    MFA_SECRET_FILE: "",
+    MFA_KEY_VERSION: 1,
+    MFA_REQUIRED_ROLES: [],
+    RECENT_AUTH_SECONDS: 300,
+    AUDIT_RETENTION_DAYS: 365,
     oauthSecret: "c".repeat(64),
+    mfaSecret: "d".repeat(64),
     COOKIE_SECURE: "false",
     secure: false,
     root,
@@ -208,9 +215,6 @@ beforeAll(async () => {
         if (mailFailure) throw new Error("smtp unavailable");
         resetLinks.push(url);
       },
-      sendPasswordResetUnavailable: async (email) => {
-        guidanceTo.push(email);
-      },
     },
     google: {
       enabled: () => true,
@@ -233,12 +237,11 @@ beforeAll(async () => {
 }, 240000);
 beforeEach(async () => {
   await db.$executeRaw`TRUNCATE users CASCADE`;
-  await db.$executeRaw`TRUNCATE outbox_events, consumer_progress, idempotency_records, service_principals, webhook_deliveries CASCADE`;
+  await db.$executeRaw`TRUNCATE outbox_events, consumer_progress, idempotency_records, service_principals, webhook_deliveries, auth_audit_events CASCADE`;
   await redis.flushdb();
   verificationLink = "";
   invitationLink = "";
   resetLinks = [];
-  guidanceTo = [];
   mailFailure = false;
   googleIdentityEmail = "google@example.test";
 });
@@ -842,6 +845,9 @@ describe("grant and refresh lifecycle", () => {
       verificationTokens: 0,
       oauthTransactions: 0,
       staffInvitations: 0,
+      resetTokens: 0,
+      mfaChallenges: 0,
+      auditEvents: 0,
     });
     expect(await db.refreshToken.count()).toBe(2);
     await db.authSession.updateMany({
@@ -856,6 +862,9 @@ describe("grant and refresh lifecycle", () => {
       verificationTokens: 0,
       oauthTransactions: 0,
       staffInvitations: 0,
+      resetTokens: 0,
+      mfaChallenges: 0,
+      auditEvents: 0,
     });
     expect(await db.refreshToken.count()).toBe(0);
     expect(await db.authSession.count()).toBe(0);
@@ -1161,7 +1170,7 @@ describe("customer quote and booking workflow", () => {
       feeCents: 57000,
       recipientPhone: "+94771234567",
     });
-    expect(booked.body.trackingNumber).toMatch(/^SD[A-Z0-9]{8}$/);
+    expect(isValidTrackingNumber(booked.body.trackingNumber)).toBe(true);
     const replay = await agent
       .post("/api/v1/parcels")
       .set({ ...headers, "Idempotency-Key": key })
@@ -2174,7 +2183,7 @@ describe("password recovery (auth plan 4.5)", () => {
     expect(Math.abs(lifetime - 30 * 60 * 1000)).toBeLessThan(5000);
   });
 
-  it("sends nothing for suspended or invited accounts and guidance only to Google-only accounts", async () => {
+  it("sends nothing for suspended, invited or passwordless accounts, exactly like an unknown address", async () => {
     const suspended = await user("CUSTOMER", "suspended@example.test");
     await db.user.update({
       where: { id: suspended.id },
@@ -2185,19 +2194,21 @@ describe("password recovery (auth plan 4.5)", () => {
       where: { id: invited.id },
       data: { status: "INVITED", passwordHash: null },
     });
-    const google = await user("CUSTOMER", "gonly@example.test");
+    const passwordless = await user("CUSTOMER", "gonly@example.test");
     await db.user.update({
-      where: { id: google.id },
+      where: { id: passwordless.id },
       data: { passwordHash: null, googleSub: "google-only-sub" },
     });
-    for (const email of [suspended.email, invited.email, google.email])
-      expect((await forgot(request.agent(api.app), email)).status).toBe(202);
+    for (const email of [suspended.email, invited.email, passwordless.email]) {
+      const res = await forgot(request.agent(api.app), email);
+      expect([res.status, res.body]).toEqual([202, { message: GENERIC }]);
+    }
     expect(resetLinks).toHaveLength(0);
-    expect(guidanceTo).toEqual([google.email]);
     expect(await db.passwordResetToken.count()).toBe(0);
-    // Guidance never invents a local password.
+    // No local password is ever invented.
     expect(
-      (await db.user.findUniqueOrThrow({ where: { id: google.id } })).passwordHash,
+      (await db.user.findUniqueOrThrow({ where: { id: passwordless.id } }))
+        .passwordHash,
     ).toBeNull();
   });
 
@@ -2619,5 +2630,605 @@ describe("change password and session management (auth plan 4.3)", () => {
       .set(bearer(mine.access));
     expect([noToken.status, badOrigin.status]).toEqual([403, 403]);
     await mine.agent.get("/api/v1/auth/me").set(bearer(mine.access)).expect(200);
+  });
+
+  it("pages sessions newest activity first with a stable cursor and rejects a bad one", async () => {
+    const account = await user();
+    const mine = await signIn();
+    for (let i = 0; i < 4; i++) await api.service.login(input.email, password);
+    // Spread last-activity times so the order is unambiguous.
+    const rows = await db.authSession.findMany({ where: { userId: account.id } });
+    await Promise.all(
+      rows.map((row, index) =>
+        db.authSession.update({
+          where: { id: row.id },
+          data: { lastRefreshedAt: new Date(Date.now() - index * 60_000) },
+        }),
+      ),
+    );
+    const seen: string[] = [];
+    let cursor: string | null = null;
+    let pages = 0;
+    do {
+      const query: string = `limit=2${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`;
+      const res = await mine.agent
+        .get(`/api/v1/auth/sessions?${query}`)
+        .set(bearer(mine.access));
+      expect(res.status).toBe(200);
+      expect(res.body.items.length).toBeLessThanOrEqual(2);
+      seen.push(...res.body.items.map((s: { id: string }) => s.id));
+      cursor = res.body.nextCursor;
+      pages++;
+    } while (cursor && pages < 10);
+    expect(pages).toBe(3);
+    expect(new Set(seen).size).toBe(5);
+    const ordered = await db.authSession.findMany({
+      where: { userId: account.id },
+      orderBy: [{ lastRefreshedAt: "desc" }, { id: "asc" }],
+    });
+    expect(seen).toEqual(ordered.map((r) => r.id));
+    for (const bad of ["not-a-cursor", Buffer.from("x|y").toString("base64url")]) {
+      const res = await mine.agent
+        .get(`/api/v1/auth/sessions?cursor=${bad}`)
+        .set(bearer(mine.access));
+      expect(res.status).toBe(400);
+    }
+    for (const badLimit of ["0", "51", "abc"]) {
+      const res = await mine.agent
+        .get(`/api/v1/auth/sessions?limit=${badLimit}`)
+        .set(bearer(mine.access));
+      expect([400, 422]).toContain(res.status);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Audit trail, recent-authentication and the second factor (auth plan 4.7, section 6)
+// ---------------------------------------------------------------------------------------------
+describe("audit trail, recent authentication and MFA", () => {
+  const NEW_PASSWORD = "Another long test passphrase 9!";
+  const bearerHeader = (token: string) => ({ Authorization: `Bearer ${token}` });
+  const secretsSeen = [password, NEW_PASSWORD, "wrong-password-entirely"];
+
+  /** An authenticated mutation the way the SPA sends one: bearer, exact Origin and CSRF token. */
+  async function authed(
+    agent: Agent,
+    method: "post" | "delete" | "patch",
+    path: string,
+    token: string,
+    body?: object,
+  ) {
+    const context = await agent.get("/api/v1/auth/csrf").expect(200);
+    const req = agent[method](path)
+      .set("Origin", config.APP_ORIGIN)
+      .set("X-CSRF-Token", context.body.csrfToken)
+      .set(bearerHeader(token));
+    return body === undefined ? req : req.send(body);
+  }
+  async function signIn(email = input.email, pw = password) {
+    const agent = request.agent(api.app);
+    const res = await post(agent, "login", { email, password: pw });
+    return { agent, res, access: res.body.accessToken as string };
+  }
+  const mfaOf = () => api.service.mfa!;
+  const secretOf = async (userId: number) => {
+    const factor = await db.mfaFactor.findUniqueOrThrow({ where: { userId } });
+    return mfaOf().decryptSecret(factor.encryptedSecret, factor.keyVersion);
+  };
+  /** A currently valid code, resetting the replay guard so a test can use several in a row. */
+  async function freshCode(userId: number) {
+    await db.mfaFactor.update({ where: { userId }, data: { lastUsedStep: null } });
+    return totpAt(await secretOf(userId), Date.now());
+  }
+  const age = (userId: number, minutes: number) =>
+    db.authSession.updateMany({
+      where: { userId },
+      data: {
+        authenticatedAt: new Date(Date.now() - minutes * 60_000),
+        reauthenticatedAt: null,
+        mfaVerifiedAt: null,
+      },
+    });
+  /** Enrols and confirms a factor for a freshly signed-in user; returns the recovery codes. */
+  async function enableMfa(agent: Agent, access: string, userId: number) {
+    const enrol = await authed(agent, "post", "/api/v1/auth/mfa/enrol", access, {});
+    expect(enrol.status).toBe(200);
+    const code = totpAt(enrol.body.secret, Date.now());
+    const confirm = await authed(agent, "post", "/api/v1/auth/mfa/confirm", access, { code });
+    expect(confirm.status).toBe(200);
+    expect(await db.mfaFactor.count({ where: { userId, confirmedAt: { not: null } } })).toBe(1);
+    return confirm.body.recoveryCodes as string[];
+  }
+  const eventsOf = (type: string) =>
+    db.authAuditEvent.findMany({ where: { eventType: type }, orderBy: { occurredAt: "asc" } });
+
+  describe("audit trail", () => {
+    it("records sign-in successes and failures without ever storing credentials", async () => {
+      const account = await user();
+      await post(request.agent(api.app), "login", { email: input.email, password: "wrong-password-entirely" });
+      await post(request.agent(api.app), "login", { email: "nobody@example.test", password: "wrong-password-entirely" });
+      const ok = await signIn();
+      expect(ok.res.status).toBe(200);
+      const logins = await eventsOf("LOGIN");
+      expect(logins.map((e) => [e.outcome, e.targetUserId])).toEqual([
+        ["FAILURE", account.id],
+        ["FAILURE", null],
+        ["SUCCESS", account.id],
+      ]);
+      expect(logins[2]).toMatchObject({ actorUserId: account.id, metadata: { method: "password" } });
+      const everything = JSON.stringify(await db.authAuditEvent.findMany());
+      for (const secret of [...secretsSeen, input.email, "nobody@example.test", ok.access])
+        expect(everything).not.toContain(secret);
+    });
+
+    it("records logout, logout-all, session revocation, refresh reuse and password changes", async () => {
+      const account = await user();
+      const first = await signIn();
+      const second = await signIn();
+      await post(second.agent, "logout");
+      await authed(first.agent, "post", "/api/v1/auth/logout-all", first.access, {});
+      const third = await signIn();
+      const change = await authed(third.agent, "post", "/api/v1/auth/change-password", third.access, {
+        currentPassword: password,
+        newPassword: NEW_PASSWORD,
+      });
+      expect(change.status).toBe(200);
+      await authed(third.agent, "post", "/api/v1/auth/change-password", change.body.accessToken, {
+        currentPassword: "wrong-password-entirely",
+        newPassword: password,
+      });
+      const types = (await db.authAuditEvent.findMany({ orderBy: { occurredAt: "asc" } })).map(
+        (e) => `${e.eventType}:${e.outcome}`,
+      );
+      expect(types).toEqual(
+        expect.arrayContaining([
+          "LOGOUT:SUCCESS",
+          "LOGOUT_ALL:SUCCESS",
+          "PASSWORD_CHANGE:SUCCESS",
+          "PASSWORD_CHANGE:FAILURE",
+        ]),
+      );
+      for (const event of await db.authAuditEvent.findMany({ where: { eventType: { in: ["LOGOUT", "LOGOUT_ALL", "PASSWORD_CHANGE"] } } }))
+        expect(event.targetUserId).toBe(account.id);
+    });
+
+    it("records the reuse of a consumed refresh token as a failure against the account", async () => {
+      const account = await user();
+      const login = await api.service.login(input.email, password);
+      const rotated = await api.service.refresh(login.refreshToken);
+      expect(rotated.refreshToken).not.toBe(login.refreshToken);
+      await expect(api.service.refresh(login.refreshToken)).rejects.toMatchObject({ status: 401 });
+      const reuse = await eventsOf("REFRESH_REUSE");
+      expect(reuse).toHaveLength(1);
+      expect(reuse[0]).toMatchObject({ outcome: "FAILURE", targetUserId: account.id });
+    });
+
+    it("records password reset requests and completions, and carries the request's correlation id", async () => {
+      const account = await user();
+      const agent = request.agent(api.app);
+      const context = await agent.get("/api/v1/auth/csrf").expect(200);
+      await agent
+        .post("/api/v1/auth/forgot-password")
+        .set("Origin", config.APP_ORIGIN)
+        .set("X-CSRF-Token", context.body.csrfToken)
+        .set("X-Correlation-ID", "audit-trace-0001")
+        .send({ email: input.email })
+        .expect(202);
+      const link = resetLinks.at(-1)!;
+      await post(request.agent(api.app), "reset-password", {
+        token: link.split("#token=")[1]!,
+        password: NEW_PASSWORD,
+      });
+      const requested = await eventsOf("PASSWORD_RESET_REQUESTED");
+      expect(requested).toHaveLength(1);
+      expect(requested[0]).toMatchObject({ targetUserId: account.id, correlationId: "audit-trace-0001" });
+      expect(await eventsOf("PASSWORD_RESET")).toHaveLength(1);
+    });
+
+    it("lets only an Admin read the trail, newest first, with filters and a stable cursor", async () => {
+      const customer = await user();
+      const admin = await user("ADMIN", "audit-admin@example.test");
+      for (let i = 0; i < 3; i++) await signIn();
+      const dispatcher = await user("DISPATCHER", "audit-dispatcher@example.test");
+      const adminSession = await signIn(admin.email);
+      const url = "/api/v1/admin/audit-events";
+      expect((await request(api.app).get(url)).status).toBe(401);
+      for (const who of [await signIn(), await signIn(dispatcher.email)])
+        expect((await who.agent.get(url).set(bearerHeader(who.access))).status).toBe(403);
+
+      const first = await adminSession.agent.get(`${url}?limit=2`).set(bearerHeader(adminSession.access));
+      expect(first.status).toBe(200);
+      expect(first.headers["cache-control"]).toBe("no-store");
+      expect(first.body.items).toHaveLength(2);
+      expect(first.body.nextCursor).toEqual(expect.any(String));
+      const second = await adminSession.agent
+        .get(`${url}?limit=2&cursor=${encodeURIComponent(first.body.nextCursor)}`)
+        .set(bearerHeader(adminSession.access));
+      const ids = [...first.body.items, ...second.body.items].map((e: { id: string }) => e.id);
+      expect(new Set(ids).size).toBe(ids.length);
+      const times = first.body.items.map((e: { occurredAt: string }) => e.occurredAt);
+      expect([...times].sort().reverse()).toEqual(times);
+
+      const mine = await adminSession.agent
+        .get(`${url}?userId=${customer.id}&eventType=LOGIN&limit=200`)
+        .set(bearerHeader(adminSession.access));
+      expect(mine.body.items.length).toBeGreaterThanOrEqual(3);
+      expect(mine.body.items.every((e: { eventType: string; targetUserId: number }) => e.eventType === "LOGIN" && e.targetUserId === customer.id)).toBe(true);
+      for (const bad of ["cursor=not-valid", "eventType=NOPE", "limit=0", "limit=201", "userId=abc"])
+        expect([400, 422]).toContain(
+          (await adminSession.agent.get(`${url}?${bad}`).set(bearerHeader(adminSession.access))).status,
+        );
+    });
+
+    it("keeps the trail when the account is deleted and removes only events past retention", async () => {
+      const account = await user();
+      await signIn();
+      // Sessions hold a RESTRICT-style reference to the user; the audit rows deliberately do not.
+      await db.authSession.deleteMany({ where: { userId: account.id } });
+      await db.user.delete({ where: { id: account.id } });
+      expect(await db.authAuditEvent.count({ where: { targetUserId: account.id } })).toBeGreaterThan(0);
+      await db.authAuditEvent.create({
+        data: { eventType: "LOGIN", outcome: "SUCCESS", occurredAt: new Date(Date.now() - 400 * 86_400_000) },
+      });
+      const removed = await cleanupAuth(db, new Date(), { auditRetentionDays: 365 });
+      expect(removed.auditEvents).toBe(1);
+      expect(await db.authAuditEvent.count({ where: { targetUserId: account.id } })).toBeGreaterThan(0);
+    });
+  });
+
+  describe("recent authentication", () => {
+    async function adminAndTarget() {
+      await user("ADMIN", "recent-admin@example.test");
+      const target = await user("CUSTOMER", "target@example.test");
+      const admin = await signIn("recent-admin@example.test");
+      return { admin, target };
+    }
+    const suspend = (admin: Awaited<ReturnType<typeof signIn>>, id: number, token = admin.access) =>
+      authed(admin.agent, "patch", `/api/v1/admin/users/${id}/status`, token, { status: "SUSPENDED" });
+
+    it("lets a sensitive action through right after sign-in and refuses it once the proof is old", async () => {
+      const { admin, target } = await adminAndTarget();
+      await age((await db.user.findUniqueOrThrow({ where: { email: "recent-admin@example.test" } })).id, 10);
+      const refused = await suspend(admin, target.id);
+      expect(refused.status).toBe(403);
+      expect(refused.body.code ?? refused.body.type).toMatch(/REAUTH_REQUIRED/);
+      expect((await db.user.findUniqueOrThrow({ where: { id: target.id } })).status).toBe("ACTIVE");
+    });
+
+    it("is restored by confirming the password, but not by a refresh", async () => {
+      const { admin, target } = await adminAndTarget();
+      const adminId = (await db.user.findUniqueOrThrow({ where: { email: "recent-admin@example.test" } })).id;
+      await age(adminId, 10);
+      const refreshed = await post(admin.agent, "refresh");
+      expect(refreshed.status).toBe(200);
+      expect((await suspend(admin, target.id, refreshed.body.accessToken)).status).toBe(403);
+
+      const wrong = await authed(admin.agent, "post", "/api/v1/auth/reauthenticate", refreshed.body.accessToken, { password: "wrong-password-entirely" });
+      expect(wrong.status).toBe(400);
+      expect((await suspend(admin, target.id, refreshed.body.accessToken)).status).toBe(403);
+
+      const ok = await authed(admin.agent, "post", "/api/v1/auth/reauthenticate", refreshed.body.accessToken, { password });
+      expect(ok.status).toBe(200);
+      expect(Date.parse(ok.body.reauthenticatedAt)).toBeGreaterThan(Date.now() - 5000);
+      expect((await suspend(admin, target.id, refreshed.body.accessToken)).status).toBe(200);
+      const audit = await eventsOf("REAUTHENTICATE");
+      expect(audit.map((e) => e.outcome)).toEqual(["FAILURE", "SUCCESS"]);
+    });
+
+    it("limits confirmation guesses per account", async () => {
+      await user();
+      const { agent, access } = await signIn();
+      const statuses: number[] = [];
+      for (let i = 0; i < 6; i++)
+        statuses.push((await authed(agent, "post", "/api/v1/auth/reauthenticate", access, { password: `wrong guess ${i} here!!` })).status);
+      expect(statuses.slice(0, 5)).toEqual([400, 400, 400, 400, 400]);
+      expect(statuses[5]).toBe(429);
+    });
+
+    it("applies to credential management as well as to account administration", async () => {
+      const owner = await user("MERCHANT", "recent-merchant@example.test");
+      await db.merchant.create({
+        data: { userId: owner.id, businessName: "Recent Shop", status: "APPROVED", reviewedAt: new Date() },
+      });
+      const session = await signIn(owner.email);
+      const make = () => authed(session.agent, "post", "/api/v1/merchant/clients", session.access, { name: "Key one", scopes: ["orders:read"] });
+      expect((await make()).status).toBe(201);
+      await age(owner.id, 10);
+      expect((await make()).status).toBe(403);
+      await authed(session.agent, "post", "/api/v1/auth/reauthenticate", session.access, { password });
+      expect((await make()).status).toBe(201);
+    });
+  });
+
+  describe("second factor (TOTP)", () => {
+    it("enrols in two steps and only a confirmed factor changes sign-in", async () => {
+      const account = await user();
+      const { agent, access } = await signIn();
+      const status = (token = access) => agent.get("/api/v1/auth/mfa").set(bearerHeader(token));
+      expect((await status()).body).toEqual({ enabled: false, pendingEnrolment: false, recoveryCodesRemaining: 0, required: false });
+
+      const enrol = await authed(agent, "post", "/api/v1/auth/mfa/enrol", access, {});
+      expect(enrol.status).toBe(200);
+      expect(enrol.body.secret).toMatch(/^[A-Z2-7]{32}$/);
+      expect(enrol.body.otpauthUri).toContain("issuer=SwiftDrop");
+      expect(enrol.body.otpauthUri).toContain(enrol.body.secret);
+      expect((await status()).body).toMatchObject({ enabled: false, pendingEnrolment: true });
+      const stored = await db.mfaFactor.findUniqueOrThrow({ where: { userId: account.id } });
+      expect(stored.encryptedSecret).not.toContain(enrol.body.secret);
+      expect(stored.confirmedAt).toBeNull();
+      // Pending means sign-in is still password only.
+      expect((await signIn()).res.body.state).toBe("authenticated");
+
+      const wrong = await authed(agent, "post", "/api/v1/auth/mfa/confirm", access, { code: "000000" });
+      expect(wrong.status).toBe(400);
+      expect((await status()).body.enabled).toBe(false);
+      const code = totpAt(enrol.body.secret, Date.now());
+      const confirm = await authed(agent, "post", "/api/v1/auth/mfa/confirm", access, { code });
+      expect(confirm.status).toBe(200);
+      expect(confirm.body.recoveryCodes).toHaveLength(10);
+      for (const c of confirm.body.recoveryCodes) expect(c).toMatch(/^[2-9A-HJKMNP-Z]{5}-[2-9A-HJKMNP-Z]{5}$/);
+      expect(new Set(confirm.body.recoveryCodes).size).toBe(10);
+      expect((await status()).body).toMatchObject({ enabled: true, pendingEnrolment: false, recoveryCodesRemaining: 10 });
+      // Only keyed hashes of the codes are stored.
+      const hashes = (await db.mfaRecoveryCode.findMany()).map((c) => c.codeHash);
+      for (const c of confirm.body.recoveryCodes) expect(hashes).not.toContain(c);
+      expect((await authed(agent, "post", "/api/v1/auth/mfa/enrol", access, {})).status).toBe(409);
+      expect((await eventsOf("MFA_ENABLED")).map((e) => e.outcome)).toEqual(["FAILURE", "SUCCESS"]);
+    });
+
+    it("requires a recent password proof to start enrolment and an authenticated user throughout", async () => {
+      const account = await user();
+      const { agent, access } = await signIn();
+      await age(account.id, 10);
+      const refused = await authed(agent, "post", "/api/v1/auth/mfa/enrol", access, {});
+      expect(refused.status).toBe(403);
+      expect(await db.mfaFactor.count()).toBe(0);
+      expect((await post(request.agent(api.app), "mfa/confirm", { code: "123456" })).status).toBe(401);
+      expect((await request(api.app).get("/api/v1/auth/mfa")).status).toBe(401);
+    });
+
+    it("turns a correct password into a challenge, not a session", async () => {
+      const account = await user();
+      const { agent, access } = await signIn();
+      await enableMfa(agent, access, account.id);
+      const login = await post(request.agent(api.app), "login", { email: input.email, password });
+      expect(login.status).toBe(200);
+      expect(login.body).toMatchObject({ state: "mfa_required", expiresIn: 300 });
+      expect(login.body.accessToken).toBeUndefined();
+      expect(([] as string[]).concat(login.headers["set-cookie"] ?? []).join(";")).not.toMatch(/refresh=/);
+      expect(login.body.challengeToken).toMatch(/^[A-Za-z0-9_-]{43}$/);
+      const stored = await db.mfaChallenge.findFirstOrThrow();
+      expect(stored.tokenHash).toBe(createHash("sha256").update(login.body.challengeToken).digest("hex"));
+      // The token alone is no credential.
+      await request(api.app).get("/api/v1/auth/me").set(bearerHeader(login.body.challengeToken)).expect(401);
+    });
+
+    it("completes sign-in with a current code and refuses a replay of that code", async () => {
+      const account = await user();
+      const { agent, access } = await signIn();
+      await enableMfa(agent, access, account.id);
+      const challenge = async () =>
+        (await post(request.agent(api.app), "login", { email: input.email, password })).body.challengeToken as string;
+      const code = await freshCode(account.id);
+      const token = await challenge();
+      const verifier = request.agent(api.app);
+      const done = await post(verifier, "mfa/challenge/verify", { challengeToken: token, code });
+      expect(done.status).toBe(200);
+      expect(done.body.state).toBe("authenticated");
+      expect(([] as string[]).concat(done.headers["set-cookie"] ?? []).join(";")).toMatch(/swiftdrop-refresh=/);
+      await verifier.get("/api/v1/auth/me").set(bearerHeader(done.body.accessToken)).expect(200);
+      const session = await db.authSession.findFirstOrThrow({ where: { userId: account.id }, orderBy: { authenticatedAt: "desc" } });
+      expect(session.mfaVerifiedAt).not.toBeNull();
+      // The same code, even on a fresh challenge, is a replay.
+      const replay = await post(request.agent(api.app), "mfa/challenge/verify", { challengeToken: await challenge(), code });
+      expect(replay.status).toBe(401);
+      expect(replay.body.code ?? replay.body.type).toMatch(/MFA_CHALLENGE_INVALID/);
+      // A used challenge is dead.
+      expect((await post(request.agent(api.app), "mfa/challenge/verify", { challengeToken: token, code: await freshCode(account.id) })).status).toBe(401);
+    });
+
+    it("kills a challenge after five wrong codes, even for the right one", async () => {
+      const account = await user();
+      const { agent, access } = await signIn();
+      await enableMfa(agent, access, account.id);
+      const token = (await post(request.agent(api.app), "login", { email: input.email, password })).body.challengeToken;
+      for (let i = 0; i < 5; i++)
+        expect((await post(request.agent(api.app), "mfa/challenge/verify", { challengeToken: token, code: "000000" })).status).toBe(401);
+      expect((await db.mfaChallenge.findFirstOrThrow()).attempts).toBe(5);
+      const right = await freshCode(account.id);
+      expect((await post(request.agent(api.app), "mfa/challenge/verify", { challengeToken: token, code: right })).status).toBe(401);
+      expect((await eventsOf("MFA_CHALLENGE")).filter((e) => e.outcome === "FAILURE")).toHaveLength(5);
+    });
+
+    it("refuses expired, unknown and malformed challenges and a suspended account", async () => {
+      const account = await user();
+      const { agent, access } = await signIn();
+      await enableMfa(agent, access, account.id);
+      const token = (await post(request.agent(api.app), "login", { email: input.email, password })).body.challengeToken;
+      const code = await freshCode(account.id);
+      await db.mfaChallenge.updateMany({ data: { expiresAt: new Date(Date.now() - 1000) } });
+      expect((await post(request.agent(api.app), "mfa/challenge/verify", { challengeToken: token, code })).status).toBe(401);
+      expect((await post(request.agent(api.app), "mfa/challenge/verify", { challengeToken: "A".repeat(43), code })).status).toBe(401);
+      expect((await post(request.agent(api.app), "mfa/challenge/verify", { challengeToken: "short", code })).status).toBe(400);
+      const fresh = (await post(request.agent(api.app), "login", { email: input.email, password })).body.challengeToken;
+      await db.user.update({ where: { id: account.id }, data: { status: "SUSPENDED" } });
+      expect((await post(request.agent(api.app), "mfa/challenge/verify", { challengeToken: fresh, code })).status).toBe(401);
+    });
+
+    it("allows exactly one of two simultaneous submissions of the same code", async () => {
+      const account = await user();
+      const { agent, access } = await signIn();
+      await enableMfa(agent, access, account.id);
+      const code = await freshCode(account.id);
+      const [a, b] = await Promise.all(
+        [0, 1].map(async () => {
+          const token = (await post(request.agent(api.app), "login", { email: input.email, password })).body.challengeToken;
+          return token as string;
+        }),
+      );
+      // Two challenges cannot coexist (a newer password step replaces the older one), so the
+      // race is two submissions against whichever challenge survived.
+      const live = (await db.mfaChallenge.findFirstOrThrow()).tokenHash;
+      const token = [a, b].find((t) => createHash("sha256").update(t).digest("hex") === live)!;
+      const results = await Promise.all(
+        [0, 1].map(() => api.service.verifyMfaChallenge(token, code).then(() => "ok", () => "refused")),
+      );
+      expect(results.sort()).toEqual(["ok", "refused"]);
+    });
+
+    it("signs in with a recovery code once and shows how many are left", async () => {
+      const account = await user();
+      const { agent, access } = await signIn();
+      const codes = await enableMfa(agent, access, account.id);
+      const use = async (recoveryCode: string) =>
+        post(request.agent(api.app), "mfa/challenge/recover", {
+          challengeToken: (await post(request.agent(api.app), "login", { email: input.email, password })).body.challengeToken,
+          recoveryCode,
+        });
+      const ok = await use(codes[0]!.toLowerCase().replace("-", " "));
+      expect(ok.status).toBe(200);
+      expect(ok.body.state).toBe("authenticated");
+      expect((await use(codes[0]!)).status).toBe(401);
+      expect((await use("AAAAA-AAAAA")).status).toBe(401);
+      const status = await agent.get("/api/v1/auth/mfa").set(bearerHeader(ok.body.accessToken));
+      expect(status.body.recoveryCodesRemaining).toBe(9);
+      const used = await eventsOf("MFA_RECOVERY_CODE_USED");
+      expect(used).toHaveLength(1);
+      expect(used[0]!.metadata).toMatchObject({ remaining: 9 });
+    });
+
+    it("lets only one of two simultaneous uses of a recovery code win", async () => {
+      const account = await user();
+      const { agent, access } = await signIn();
+      const codes = await enableMfa(agent, access, account.id);
+      const challenges = await Promise.all(
+        [0, 1].map(async () => {
+          // Separate accounts' worth of challenges are not possible, so insert a second row.
+          const raw = randomUUID().replace(/-/g, "").padEnd(43, "x").slice(0, 43);
+          await db.mfaChallenge.create({
+            data: { userId: account.id, tokenHash: createHash("sha256").update(raw).digest("hex"), expiresAt: new Date(Date.now() + 60_000) },
+          });
+          return raw;
+        }),
+      );
+      const results = await Promise.all(
+        challenges.map((t) => api.service.recoverMfaChallenge(t, codes[1]!).then(() => "ok", () => "refused")),
+      );
+      expect(results.sort()).toEqual(["ok", "refused"]);
+    });
+
+    it("needs a code to confirm the password and to change the factor, and replaces recovery codes", async () => {
+      const account = await user();
+      const first = await signIn();
+      const oldCodes = await enableMfa(first.agent, first.access, account.id);
+      // A new session must pass the challenge first.
+      const code0 = await freshCode(account.id);
+      const challenge = (await post(request.agent(api.app), "login", { email: input.email, password })).body.challengeToken;
+      const session = request.agent(api.app);
+      const done = await post(session, "mfa/challenge/verify", { challengeToken: challenge, code: code0 });
+      const token = done.body.accessToken as string;
+
+      const noCode = await authed(session, "post", "/api/v1/auth/reauthenticate", token, { password });
+      expect(noCode.status).toBe(400);
+      expect(noCode.body.code ?? noCode.body.type).toMatch(/MFA_CODE_REQUIRED/);
+      await age(account.id, 10);
+      expect((await authed(session, "post", "/api/v1/auth/mfa/recovery-codes", token, {})).status).toBe(403);
+      const badCode = await authed(session, "post", "/api/v1/auth/reauthenticate", token, { password, code: "000000" });
+      expect(badCode.status).toBe(400);
+      const ok = await authed(session, "post", "/api/v1/auth/reauthenticate", token, { password, code: await freshCode(account.id) });
+      expect(ok.status).toBe(200);
+
+      const regenerated = await authed(session, "post", "/api/v1/auth/mfa/recovery-codes", token, {});
+      expect(regenerated.status).toBe(200);
+      const newCodes = regenerated.body.recoveryCodes as string[];
+      expect(newCodes).toHaveLength(10);
+      expect(newCodes.some((c) => oldCodes.includes(c))).toBe(false);
+      const old = await post(request.agent(api.app), "mfa/challenge/recover", {
+        challengeToken: (await post(request.agent(api.app), "login", { email: input.email, password })).body.challengeToken,
+        recoveryCode: oldCodes[2]!,
+      });
+      expect(old.status).toBe(401);
+      expect(await eventsOf("MFA_RECOVERY_CODES_REGENERATED")).toHaveLength(1);
+    });
+
+    it("disables the factor after fresh proof and removes everything it created", async () => {
+      const account = await user();
+      const first = await signIn();
+      await enableMfa(first.agent, first.access, account.id);
+      await age(account.id, 10);
+      expect((await authed(first.agent, "delete", "/api/v1/auth/mfa", first.access)).status).toBe(403);
+      await authed(first.agent, "post", "/api/v1/auth/reauthenticate", first.access, { password, code: await freshCode(account.id) });
+      const gone = await authed(first.agent, "delete", "/api/v1/auth/mfa", first.access);
+      expect(gone.status).toBe(204);
+      expect(await db.mfaFactor.count()).toBe(0);
+      expect(await db.mfaRecoveryCode.count()).toBe(0);
+      expect((await signIn()).res.body.state).toBe("authenticated");
+      expect((await authed(first.agent, "delete", "/api/v1/auth/mfa", first.access)).status).toBe(409);
+      expect((await eventsOf("MFA_DISABLED")).map((e) => e.outcome)).toEqual(["SUCCESS"]);
+    });
+
+    it("keeps the factor when the password is reset", async () => {
+      const account = await user();
+      const { agent, access } = await signIn();
+      await enableMfa(agent, access, account.id);
+      await post(request.agent(api.app), "forgot-password", { email: input.email });
+      await post(request.agent(api.app), "reset-password", { token: resetLinks.at(-1)!.split("#token=")[1]!, password: NEW_PASSWORD });
+      const login = await post(request.agent(api.app), "login", { email: input.email, password: NEW_PASSWORD });
+      expect(login.body.state).toBe("mfa_required");
+      expect(await db.mfaFactor.count({ where: { userId: account.id, confirmedAt: { not: null } } })).toBe(1);
+    });
+
+    it("limits guesses at the confirmation code", async () => {
+      await user();
+      const { agent, access } = await signIn();
+      await authed(agent, "post", "/api/v1/auth/mfa/enrol", access, {});
+      const statuses: number[] = [];
+      for (let i = 0; i < 11; i++)
+        statuses.push((await authed(agent, "post", "/api/v1/auth/mfa/confirm", access, { code: "000000" })).status);
+      expect(statuses.slice(0, 10).every((s) => s === 400)).toBe(true);
+      expect(statuses[10]).toBe(429);
+    });
+  });
+
+  describe("required roles (MFA_REQUIRED_ROLES)", () => {
+    it("blocks privileged routes until a factor exists, then allows them, and forbids turning it off", async () => {
+      const tokens = await createTokenService(config);
+      const strict = createApp({
+        db,
+        redis,
+        config: { ...config, MFA_REQUIRED_ROLES: ["ADMIN"] } as Config,
+        tokens,
+        logger: pino({ enabled: false }),
+      });
+      const admin = await user("ADMIN", "mfa-admin@example.test");
+      const customer = await user("CUSTOMER", "mfa-customer@example.test");
+      const agent = request.agent(strict.app);
+      const login = await post(agent, "login", { email: admin.email, password });
+      const access = login.body.accessToken as string;
+      const users = () => agent.get("/api/v1/admin/users").set(bearerHeader(access));
+
+      const blocked = await users();
+      expect(blocked.status).toBe(403);
+      expect(blocked.body.code ?? blocked.body.type).toMatch(/MFA_ENROLMENT_REQUIRED/);
+      expect((await agent.get("/api/v1/auth/mfa").set(bearerHeader(access))).body.required).toBe(true);
+      expect((await agent.get("/api/v1/auth/me").set(bearerHeader(access))).status).toBe(200);
+
+      const enrol = await authed(agent, "post", "/api/v1/auth/mfa/enrol", access, {});
+      expect(enrol.status).toBe(200);
+      expect((await users()).status).toBe(403); // pending is not enough
+      const confirm = await authed(agent, "post", "/api/v1/auth/mfa/confirm", access, { code: totpAt(enrol.body.secret, Date.now()) });
+      expect(confirm.status).toBe(200);
+      expect((await users()).status).toBe(200);
+
+      const off = await authed(agent, "delete", "/api/v1/auth/mfa", access);
+      expect(off.status).toBe(403);
+      expect(off.body.code ?? off.body.type).toMatch(/MFA_REQUIRED_FOR_ROLE/);
+      expect(await db.mfaFactor.count({ where: { userId: admin.id, confirmedAt: { not: null } } })).toBe(1);
+
+      // Roles outside the list are unaffected.
+      const other = request.agent(strict.app);
+      const cLogin = await post(other, "login", { email: customer.email, password });
+      expect((await other.get("/api/v1/parcels").set(bearerHeader(cLogin.body.accessToken))).status).not.toBe(403);
+    });
   });
 });

@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "@jest/globals";
+import { formatTrackingNumber } from "@swiftdrop/contracts";
 import { createServer, type Server as HttpServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { io as connect, type Socket } from "socket.io-client";
@@ -22,16 +23,7 @@ import { HttpError } from "../src/shared/problem.js";
 const PARCEL = "11111111-1111-4111-8111-111111111111";
 const OTHER_PARCEL = "33333333-3333-4333-8333-333333333333";
 
-// Mirrors trackingNumberSchema: "SD" + 7 body characters + 1 check character.
-function checkDigit(body: string) {
-  const alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
-  const sum = [...body].reduce(
-    (total, char) => total + alphabet.indexOf(char),
-    0,
-  );
-  return alphabet[sum % alphabet.length]!;
-}
-const validTracking = `SD1234567${checkDigit("1234567")}`;
+const validTracking = formatTrackingNumber("7KQ2M9XA");
 
 const statusEvent = (
   to: "PICKED_UP" | "DELIVERED",
@@ -248,11 +240,11 @@ describe("realtime gateway (FR-I6)", () => {
       error: "INVALID",
     });
     expect(
-      await ask(guest, "track:join", { trackingNumber: "SD00000001" }),
+      await ask(guest, "track:join", { trackingNumber: "SD1234567A" }),
     ).toMatchObject({
       ok: false,
     });
-    const unknown = `SD7654321${checkDigit("7654321")}`;
+    const unknown = formatTrackingNumber("4HNP6RTD");
     expect(
       await ask(guest, "track:join", { trackingNumber: unknown }),
     ).toMatchObject({

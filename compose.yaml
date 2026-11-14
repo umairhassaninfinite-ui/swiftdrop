@@ -35,6 +35,8 @@ x-core-env: &core-env
   CSRF_SECRET_FILE: /run/swiftdrop/auth/csrf.key
   RATE_LIMIT_SECRET_FILE: /run/swiftdrop/auth/rate-limit.key
   OAUTH_TRANSACTION_SECRET_FILE: /run/swiftdrop/auth/oauth.key
+  MFA_SECRET_FILE: /run/swiftdrop/auth/mfa.key
+  MFA_REQUIRED_ROLES: ${SD_MFA_REQUIRED_ROLES:-}
   COOKIE_SECURE: ${SD_COOKIE_SECURE:-false}
   OUTBOX_RELAY_URL: http://outbox-relay:3101
 

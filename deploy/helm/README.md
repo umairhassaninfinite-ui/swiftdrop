@@ -71,7 +71,7 @@ Create these Secrets out of band (sealed-secrets, external-secrets, `kubectl`) â
 | Secret | Keys |
 |---|---|
 | `swiftdrop-credentials` | `postgres-password`, `rabbitmq-user`, `rabbitmq-password`, `minio-access-key`, `minio-secret-key` |
-| `swiftdrop-auth` | `private.pem`, `public-keys.json`, `csrf.key`, `rate-limit.key`, `oauth.key` |
+| `swiftdrop-auth` | `private.pem`, `public-keys.json`, `csrf.key`, `rate-limit.key`, `oauth.key`, `mfa.key` |
 | `swiftdrop-notification-signer` | `signer.json`, `<keyId>.pem` |
 | `swiftdrop-tls` | the Ingress certificate |
 

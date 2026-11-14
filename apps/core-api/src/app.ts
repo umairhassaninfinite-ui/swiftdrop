@@ -13,7 +13,9 @@ import { logger as defaultLogger } from "./shared/logger.js";
 import { correlationMiddleware } from "./shared/correlation.js";
 import {
   AuthService,
+  MfaService,
   authenticate,
+  createAuditRouter,
   createAuthRouter,
 } from "./modules/auth/index.js";
 import type { TokenService } from "./modules/auth/jwt.js";
@@ -82,6 +84,7 @@ export function createApp(deps: {
     deps.mailer,
     deps.google,
     logger,
+    new MfaService(db, config),
   );
   const users = new UsersService(db, config.APP_ORIGIN, deps.mailer);
   const limiter = new RateLimiter(redis, config.rateSecret);
@@ -158,6 +161,7 @@ export function createApp(deps: {
     res.json(res.locals.user),
   );
   app.use("/api/v1/auth", createAuthRouter(service, limiter, config, users));
+  app.use("/api/v1/admin/audit-events", createAuditRouter(db, service));
   app.use("/api/v1/admin/users", createUsersRouter(users, service, config));
   app.use(
     "/api/v1/admin/webhook-deliveries",

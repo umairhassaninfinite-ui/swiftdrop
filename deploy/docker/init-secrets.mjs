@@ -11,11 +11,25 @@ if (process.env.NODE_ENV === "production")
 
 const dir = process.env.SECRETS_DIR ?? "/run/swiftdrop/auth";
 const keyId = process.env.AUTH_KEY_ID ?? "local-1";
-const names = ["private.pem", "public-keys.json", "csrf.key", "rate-limit.key", "oauth.key"];
+const names = ["private.pem", "public-keys.json", "csrf.key", "rate-limit.key", "oauth.key", "mfa.key"];
 
 mkdirSync(dir, { recursive: true, mode: 0o700 });
 if (names.every((name) => existsSync(join(dir, name)))) {
   console.log("Auth secrets already present; nothing to do.");
+  process.exit(0);
+}
+// A volume made before mfa.key existed: add just that key, leave every other secret as it is.
+if (
+  names.slice(0, -1).every((name) => existsSync(join(dir, name))) &&
+  !existsSync(join(dir, "mfa.key"))
+) {
+  chownSync(dir, 1000, 1000);
+  writeFileSync(join(dir, "mfa.key"), randomBytes(48).toString("base64url"), {
+    mode: 0o600,
+    flag: "wx",
+  });
+  chownSync(join(dir, "mfa.key"), 1000, 1000);
+  console.log("Added mfa.key to an existing auth secret volume.");
   process.exit(0);
 }
 if (names.some((name) => existsSync(join(dir, name))))
@@ -27,6 +41,7 @@ const { privateKey, publicKey } = generateKeyPairSync("rsa", { modulusLength: 30
 const values = [
   privateKey.export({ type: "pkcs8", format: "pem" }),
   JSON.stringify({ [keyId]: publicKey.export({ type: "spki", format: "pem" }) }),
+  randomBytes(48).toString("base64url"),
   randomBytes(48).toString("base64url"),
   randomBytes(48).toString("base64url"),
   randomBytes(48).toString("base64url"),

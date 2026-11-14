@@ -26,6 +26,8 @@ interface MatrixRule {
 describe("Role × Endpoint Authorization Matrix Harness (plan.md §8.2, §12.1)", () => {
   // Mock AuthService that implements token parsing and user resolution
   const mockAuthService = {
+    // No role in this matrix has a second-factor requirement configured.
+    mfaEnrolmentRequired: async () => false,
     authenticate: async (header?: string) => {
       if (!header || !header.startsWith("Bearer ")) {
         throw new HttpError(401, "UNAUTHORISED", "Authentication required.");

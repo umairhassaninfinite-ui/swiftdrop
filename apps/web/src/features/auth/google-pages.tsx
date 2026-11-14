@@ -3,7 +3,7 @@ import { Link, Navigate, useSearchParams } from "react-router-dom";
 import { completeProfileSchema } from "@swiftdrop/contracts";
 import { beginGoogleLink, completeProfile, errorMessage } from "./client.js";
 import { roleHome, useSession } from "./session.js";
-import { ActiveSessions, ChangePasswordForm } from "./security.js";
+import { ActiveSessions, ChangePasswordForm, MfaSettings } from "./security.js";
 
 export function CompleteProfile() {
   const { state, updateUser } = useSession();
@@ -150,6 +150,7 @@ export function SecuritySettings() {
       <span className="eyebrow">Security settings</span>
       <h1 id="security-title">Your account security.</h1>
       <ChangePasswordForm onChanged={() => setReloadKey((key) => key + 1)} />
+      <MfaSettings />
       <ActiveSessions reloadKey={reloadKey} />
       {state.user.role === "CUSTOMER" && <LinkGoogle />}
     </section>

@@ -30,10 +30,13 @@ credentials:
   data: {}
 
 # Secret holding the human-auth key material, mounted at /run/swiftdrop/auth. Required keys:
-#   private.pem, public-keys.json, csrf.key, rate-limit.key, oauth.key
+#   private.pem, public-keys.json, csrf.key, rate-limit.key, oauth.key, mfa.key
 auth:
   existingSecret: swiftdrop-auth
   keyId: key-1
+  # Comma-separated roles that must enrol a second factor before using privileged routes,
+  # e.g. "ADMIN,DISPATCHER". Empty keeps every role optional.
+  mfaRequiredRoles: ""
 
 # Secret from `services-cli provision --service notification-svc`: signer.json and <keyId>.pem,
 # mounted at /app/.local/services/notification-svc.
