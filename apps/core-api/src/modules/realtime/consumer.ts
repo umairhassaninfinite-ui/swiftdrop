@@ -1,4 +1,5 @@
 import type { Logger } from "pino";
+import { correlationIdFromHeaders } from "@swiftdrop/contracts";
 import { QUEUES, declareTopology, runWithBroker } from "@swiftdrop/messaging";
 
 /**
@@ -28,7 +29,14 @@ export function startRealtimeConsumer(options: {
           if (!message) return;
           void options
             .handle(message.content)
-            .catch(() => options.logger.warn({ event: "realtime_emit_failed" }))
+            .catch(() =>
+              options.logger.warn({
+                event: "realtime_emit_failed",
+                correlationId: correlationIdFromHeaders(
+                  message.properties.headers,
+                ),
+              }),
+            )
             .finally(() => {
               try {
                 channel.ack(message);

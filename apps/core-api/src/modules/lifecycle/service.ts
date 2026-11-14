@@ -8,6 +8,7 @@ import {
   type ParcelStatusChangedEvent,
   type ParcelStatus,
 } from "@swiftdrop/contracts";
+import { currentCorrelationId } from "../../shared/correlation.js";
 import { HttpError } from "../../shared/problem.js";
 import {
   activeCourierOf,
@@ -48,6 +49,7 @@ export class LifecycleService {
               version: true,
               attemptCount: true,
               trackingNumber: true,
+              merchantId: true,
             },
           });
           if (!parcel)
@@ -106,6 +108,7 @@ export class LifecycleService {
             data: {
               parcelId,
               trackingNo: parcel.trackingNumber,
+              ...(parcel.merchantId ? { merchantId: parcel.merchantId } : {}),
               from,
               to,
               town,
@@ -119,6 +122,7 @@ export class LifecycleService {
               eventType: event.type,
               aggregateId: parcelId,
               payload: event,
+              correlationId: currentCorrelationId() ?? null,
             },
           });
           if (courierId !== null && isFinishedForCapacity(to, newAttemptCount))
@@ -216,6 +220,7 @@ export class LifecycleService {
             data: {
               parcelId,
               trackingNo: parcel.trackingNumber,
+              ...(parcel.merchantId ? { merchantId: parcel.merchantId } : {}),
               from,
               to: "CANCELLED",
               town: parcel.originZone.town,
@@ -229,6 +234,7 @@ export class LifecycleService {
               eventType: event.type,
               aggregateId: parcelId,
               payload: event,
+              correlationId: currentCorrelationId() ?? null,
             },
           });
           if (courierId !== null)

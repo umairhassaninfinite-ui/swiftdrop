@@ -428,20 +428,24 @@ export class ParcelService {
             include: parcelInclude,
           });
           const response = publicParcel(parcel);
-          const eventId = randomUUID();
-          await tx.outboxEvent.create({
+          // Same envelope as customer bookings, plus the merchant UUID so webhook-svc routes it
+          // (C-14). No recipient contact data (NFR-4).
+          await outbox.add(tx, {
+            type: ROUTING_KEYS.PARCEL_CREATED,
+            aggregateId: parcelId,
+            sequence: 1,
+            occurredAt: now,
             data: {
-              eventId,
-              eventType: "parcel.created",
-              aggregateId: parcelId,
-              payload: {
-                eventId,
-                eventType: "parcel.created",
-                parcelId,
-                status: "CREATED",
-                town: origin.town,
-                createdAt: now.toISOString(),
-              },
+              parcelId,
+              trackingNo: tracking,
+              merchantId: merchant.id,
+              to: "CREATED",
+              town: origin.town,
+              customerId: String(merchant.userId),
+              originZone: origin.town,
+              destZone: destination.town,
+              feeCents,
+              scheduledDate: now.toISOString(),
             },
           });
           await tx.idempotencyRecord.create({

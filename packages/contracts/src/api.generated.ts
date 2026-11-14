@@ -10713,7 +10713,8 @@ export interface paths {
                                 /** Format: uuid */
                                 eventId: string;
                                 eventType: string;
-                                merchantId: number;
+                                /** Format: uuid */
+                                merchantId: string;
                                 /** @enum {string} */
                                 status: "PENDING" | "SUCCESS" | "FAILED" | "SKIPPED";
                                 currentRun: number;
@@ -10939,7 +10940,8 @@ export interface paths {
                             /** Format: uuid */
                             eventId: string;
                             eventType: string;
-                            merchantId: number;
+                            /** Format: uuid */
+                            merchantId: string;
                             /** @enum {string} */
                             status: "PENDING" | "SUCCESS" | "FAILED" | "SKIPPED";
                             currentRun: number;

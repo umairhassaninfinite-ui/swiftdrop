@@ -8,6 +8,7 @@ import { createAuthMailer } from "./modules/auth/mail.js";
 import pino from "pino";
 import { startParcelEventWorkers } from "./modules/parcels/events.js";
 import { ReceiptService } from "./modules/receipts/service.js";
+import { MerchantsService } from "./modules/merchants/index.js";
 import {
   PrivateAccess,
   createRealtimeGateway,
@@ -54,7 +55,14 @@ const { app, service, parcels } = createApp({
   workerState,
   receipts: new ReceiptService(db, config),
 });
-const internalApp = createInternalApp({ db, config, logger });
+const webhookMerchants = new MerchantsService(db, tokens, config.oauthSecret);
+const internalApp = createInternalApp({
+  db,
+  config,
+  logger,
+  webhookTargetFor: (merchantId) =>
+    webhookMerchants.webhookTargetForDelivery(merchantId),
+});
 const workers = startParcelEventWorkers(
   db,
   config.RABBITMQ_URL,

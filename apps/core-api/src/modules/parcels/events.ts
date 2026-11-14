@@ -1,7 +1,11 @@
 import { connect, type ChannelModel, type ConfirmChannel } from "amqplib";
 import type { Logger } from "pino";
 import type { Database } from "@swiftdrop/db";
-import { isSwiftDropEvent, ROUTING_KEYS } from "@swiftdrop/contracts";
+import {
+  correlationIdFromHeaders,
+  isSwiftDropEvent,
+  ROUTING_KEYS,
+} from "@swiftdrop/contracts";
 import type { ReceiptService } from "../receipts/service.js";
 
 type WorkerState = { connected: boolean };
@@ -51,7 +55,11 @@ export function startParcelEventWorkers(
         await consumerChannel.prefetch(32);
         await consumerChannel.consume(QUEUE, (message) => {
           if (!message) return;
-          void processMessage(message.content, message.properties.messageId)
+          void processMessage(
+            message.content,
+            message.properties.messageId,
+            correlationIdFromHeaders(message.properties.headers),
+          )
             .then(() => {
               try {
                 consumerChannel.ack(message);
@@ -96,7 +104,11 @@ export function startParcelEventWorkers(
       }
     }
   };
-  const processMessage = async (body: Buffer, messageId?: string) => {
+  const processMessage = async (
+    body: Buffer,
+    messageId?: string,
+    correlationId?: string,
+  ) => {
     let value: unknown;
     try {
       value = JSON.parse(body.toString("utf8"));
@@ -124,6 +136,7 @@ export function startParcelEventWorkers(
           eventType: event.type,
           parcelId: event.data.parcelId,
           sequence: event.sequence,
+          correlationId,
         },
         "Parcel event consumed",
       );

@@ -172,6 +172,29 @@ services:
         condition: service_completed_successfully
     restart: 'no'
 
+  # One-shot: provisions webhook-svc's service-JWT signing key and principal once (X-11).
+  provision-webhook-svc:
+    <<: *core-api-image
+    command:
+      - sh
+      - -c
+      - >-
+        test -f /app/.local/services/webhook-svc/signer.json
+        && echo 'webhook-svc already provisioned'
+        || node dist/services-cli.js provision --service webhook-svc
+    environment: *core-env
+    volumes:
+      - auth-secrets:/run/swiftdrop/auth:ro
+      - service-keys:/app/.local/services
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      init-secrets:
+        condition: service_completed_successfully
+      provision-notification-svc:
+        condition: service_completed_successfully
+    restart: 'no'
+
   core-api:
     <<: *core-api-image
     environment: *core-env
@@ -229,9 +252,15 @@ services:
       DATABASE_URL: *database-url
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672
       WEBHOOK_SVC_PORT: 3102
+      CORE_INTERNAL_URL: http://core-api:3001
+      WEBHOOK_SIGNER_FILE: /app/.local/services/webhook-svc/signer.json
+    volumes:
+      - service-keys:/app/.local/services:ro
     depends_on:
-      migrate:
+      provision-webhook-svc:
         condition: service_completed_successfully
+      core-api:
+        condition: service_healthy
       rabbitmq:
         condition: service_healthy
     healthcheck:

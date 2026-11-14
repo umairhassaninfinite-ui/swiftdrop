@@ -15,6 +15,8 @@ import {
 import type { SendResult, Sender } from "../src/sender.js";
 import { HEADERS, verify } from "../src/signing.js";
 
+const MERCHANT = "33333333-3333-4333-8333-333333333333";
+
 const logger = pino({ enabled: false });
 const secret = "k".repeat(32);
 
@@ -155,7 +157,7 @@ class Harness {
       data: {
         parcelId: randomUUID(),
         trackingNo: "SD-AAAAAAAA-1",
-        merchantId: 7,
+        merchantId: MERCHANT,
         to: "PICKED_UP",
         ...overrides,
       },
@@ -360,7 +362,7 @@ describe("WebhookProcessor (FR-I4, Design Doc §7.7)", () => {
     const second = busy.event();
     const delivery = await busy.store.ensureDelivery({
       eventId: second.eventId,
-      merchantId: 7,
+      merchantId: MERCHANT,
       eventType: second.type,
       envelope: second,
     });

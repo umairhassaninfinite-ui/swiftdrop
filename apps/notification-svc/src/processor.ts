@@ -30,8 +30,15 @@ export class NotificationProcessor {
     },
   ) {}
 
-  async handle(content: Buffer): Promise<Disposition> {
-    const { store, lookup, sender, appOrigin, logger } = this.deps;
+  async handle(
+    content: Buffer,
+    correlationId?: string,
+  ): Promise<Disposition> {
+    const { store, lookup, sender, appOrigin } = this.deps;
+    // Every log line for this message carries the originating request's correlation id.
+    const logger = correlationId
+      ? this.deps.logger.child({ correlationId })
+      : this.deps.logger;
     let event: SwiftDropEvent;
     try {
       const parsed: unknown = JSON.parse(content.toString("utf8"));

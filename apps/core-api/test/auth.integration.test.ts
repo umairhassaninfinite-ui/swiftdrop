@@ -1289,7 +1289,7 @@ describe("webhook delivery log and replay (M08)", () => {
   }
   async function delivery(
     status: "FAILED" | "SUCCESS" | "PENDING",
-    merchantId = 7,
+    merchantId = "33333333-3333-4333-8333-333333333333",
   ) {
     const eventId = randomUUID();
     return db.webhookDelivery.create({
@@ -1319,7 +1319,7 @@ describe("webhook delivery log and replay (M08)", () => {
     const { agent, headers } = await adminSession();
     const failed = await delivery("FAILED");
     await delivery("SUCCESS");
-    await delivery("FAILED", 9);
+    await delivery("FAILED", "44444444-4444-4444-8444-444444444444");
     const all = await agent
       .get("/api/v1/admin/webhook-deliveries")
       .set(headers)
@@ -1337,7 +1337,7 @@ describe("webhook delivery log and replay (M08)", () => {
       "updatedAt",
     ]);
     const onlyFailed = await agent
-      .get("/api/v1/admin/webhook-deliveries?status=FAILED&merchantId=7")
+      .get("/api/v1/admin/webhook-deliveries?status=FAILED&merchantId=33333333-3333-4333-8333-333333333333")
       .set(headers)
       .expect(200);
     expect(onlyFailed.body.items.map((i: { id: string }) => i.id)).toEqual([

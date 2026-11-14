@@ -24950,9 +24950,8 @@
                             "type": "string"
                           },
                           "merchantId": {
-                            "type": "integer",
-                            "minimum": 0,
-                            "exclusiveMinimum": true
+                            "type": "string",
+                            "format": "uuid"
                           },
                           "status": {
                             "type": "string",
@@ -25472,9 +25471,8 @@
                       "type": "string"
                     },
                     "merchantId": {
-                      "type": "integer",
-                      "minimum": 0,
-                      "exclusiveMinimum": true
+                      "type": "string",
+                      "format": "uuid"
                     },
                     "status": {
                       "type": "string",

@@ -337,6 +337,9 @@ importers:
       amqplib:
         specifier: ^2.2.0
         version: 2.2.0
+      jose:
+        specifier: ^6.2.14
+        version: 6.2.14
       pino:
         specifier: ^10.4.0
         version: 10.4.0

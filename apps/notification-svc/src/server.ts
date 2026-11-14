@@ -1,5 +1,6 @@
 import { z } from "zod";
 import type { Channel, ConsumeMessage } from "amqplib";
+import { correlationIdFromHeaders } from "@swiftdrop/contracts";
 import { createDatabase } from "@swiftdrop/db";
 import {
   QUEUES,
@@ -77,6 +78,7 @@ async function consume(channel: Channel) {
       const work = (async () => {
         const disposition: Disposition = await processor.handle(
           message.content,
+          correlationIdFromHeaders(message.properties.headers),
         );
         try {
           if (disposition === "ack") channel.ack(message);

@@ -57,7 +57,7 @@ Status changes serialize through PostgreSQL advisory lock `(1396982864, 1)` befo
 
 ## Worker service credentials and booking-contact demo
 
-The internal listener accepts only RS256 service JWTs backed by live service-principal and public-key rows. Service credentials are separate from human access grants. The local provisioner creates `notification-svc` with `notifications:lookup`; `webhook-svc` has its own audience/key and `webhooks:config` permission fixture, but webhook configuration lookup is pending M02/M08 contract agreement. The notification route supports persisted `parcel.created` events and returns current customer email plus recipient SMS contact; customer suspension does not change an existing booking's contacts. Private keys and signer metadata stay in ignored `.local/services/` with mode `0600`; no endpoint issues service tokens.
+The internal listener accepts only RS256 service JWTs backed by live service-principal and public-key rows. Service credentials are separate from human access grants. The local provisioner creates `notification-svc` with `notifications:lookup`; `webhook-svc` has its own audience/key and `webhooks:config` permission, and reads merchant webhook URL/secret through `GET /internal/v1/webhooks/merchants/{merchantId}/config` (see [docs/messaging.md](docs/messaging.md)). The notification route supports persisted `parcel.created` events and returns current customer email plus recipient SMS contact; customer suspension does not change an existing booking's contacts. Private keys and signer metadata stay in ignored `.local/services/` with mode `0600`; no endpoint issues service tokens.
 
 After setup above, create a booking as a customer, then run:
 
