@@ -527,6 +527,22 @@ export class AuthService {
       },
     };
   }
+  /** A new session family with its first credentials; the caller holds the user lock. */
+  private async startSession(tx: Tx, user: User) {
+    const now = Date.now();
+    const limits = this.limits(user.roleId);
+    const family = await tx.authSession.create({
+      data: {
+        userId: user.id,
+        roleAtAuthentication: user.roleId,
+        idleExpiresAt: new Date(
+          now + Math.min(limits.idle, limits.absolute) * 1000,
+        ),
+        absoluteExpiresAt: new Date(now + limits.absolute * 1000),
+      },
+    });
+    return this.credentials(tx, user, family);
+  }
   async login(email: string, password: string) {
     const candidate = await this.db.user.findUnique({ where: { email } });
     if (
@@ -545,19 +561,7 @@ export class AuthService {
         user.roleId !== candidate.roleId
       )
         return null;
-      const now = Date.now();
-      const limits = this.limits(user.roleId);
-      const family = await tx.authSession.create({
-        data: {
-          userId: user.id,
-          roleAtAuthentication: user.roleId,
-          idleExpiresAt: new Date(
-            now + Math.min(limits.idle, limits.absolute) * 1000,
-          ),
-          absoluteExpiresAt: new Date(now + limits.absolute * 1000),
-        },
-      });
-      return this.credentials(tx, user, family);
+      return this.startSession(tx, user);
     });
     if (!result) throw unauthorised();
     return result;
@@ -652,6 +656,226 @@ export class AuthService {
     await this.db.$transaction(async (tx) => {
       await this.lockUser(tx, userId);
       await revokeUserSessions(tx, userId, "logout_all");
+    });
+  }
+  // ---- Password recovery and session management (auth plan 4.3, 4.5, section 7) ----
+
+  /**
+   * Always accepted, never reveals whether the address exists. Only an active account with a
+   * local password gets a reset link; a Google-only account gets sign-in guidance; suspended,
+   * invited and unknown addresses get nothing. Mail is sent after the token commits and is not
+   * awaited, so response time does not depend on whether an address is registered.
+   */
+  async requestPasswordReset(email: string) {
+    if (!this.mailer?.sendPasswordReset) return;
+    const user = await this.db.user.findUnique({ where: { email } });
+    if (!user || user.status !== "ACTIVE") return;
+    if (!user.passwordHash) {
+      if (user.googleSub && this.mailer.sendPasswordResetUnavailable)
+        this.deliver(
+          this.mailer.sendPasswordResetUnavailable(
+            user.email,
+            `${this.config.APP_ORIGIN}/auth/login`,
+          ),
+        );
+      return;
+    }
+    const raw = randomBytes(32).toString("base64url");
+    const issued = await this.db.$transaction(async (tx) => {
+      await this.lockUser(tx, user.id);
+      const current = await tx.user.findUniqueOrThrow({
+        where: { id: user.id },
+      });
+      if (current.status !== "ACTIVE" || !current.passwordHash) return false;
+      const latest = await tx.passwordResetToken.findFirst({
+        where: { userId: user.id },
+        orderBy: { generation: "desc" },
+      });
+      // One link per minute per account: a burst cannot flood a mailbox.
+      if (latest && Date.now() - latest.createdAt.getTime() < 60_000)
+        return false;
+      await tx.passwordResetToken.updateMany({
+        where: { userId: user.id, consumedAt: null, revokedAt: null },
+        data: { revokedAt: new Date() },
+      });
+      await tx.passwordResetToken.create({
+        data: {
+          userId: user.id,
+          tokenHash: tokenHash(raw),
+          generation: (latest?.generation ?? 0) + 1,
+          expiresAt: new Date(Date.now() + 30 * 60 * 1000),
+        },
+      });
+      return true;
+    });
+    if (!issued) return;
+    this.deliver(
+      this.mailer.sendPasswordReset(
+        user.email,
+        `${this.config.APP_ORIGIN}/auth/reset-password#token=${raw}`,
+      ),
+    );
+  }
+  private deliver(sending: Promise<unknown>) {
+    // The account and its hashed token stay valid; the generic request can be repeated.
+    sending.catch(() => this.logger?.warn({ event: "password_mail_failed" }));
+  }
+
+  /**
+   * Consumes a reset token exactly once, sets the new password and signs the account out
+   * everywhere. It never logs the user in, unsuspends, changes the role or touches a Google
+   * link. A token that is unknown, expired, used or replaced is one indistinguishable error.
+   */
+  async resetPassword(raw: string, password: string) {
+    const invalid = () =>
+      new HttpError(
+        400,
+        "INVALID_RESET",
+        "This password reset link is invalid or expired.",
+      );
+    if (!/^[A-Za-z0-9_-]{43}$/.test(raw)) throw invalid();
+    const hash = tokenHash(raw);
+    const known = await this.db.passwordResetToken.findUnique({
+      where: { tokenHash: hash },
+      select: { userId: true },
+    });
+    if (!known) throw invalid();
+    const passwordHash = await hashPassword(password);
+    const done = await this.db.$transaction(async (tx) => {
+      await this.lockUser(tx, known.userId);
+      const user = await tx.user.findUnique({ where: { id: known.userId } });
+      const token = await tx.passwordResetToken.findUnique({
+        where: { tokenHash: hash },
+      });
+      const now = new Date();
+      if (
+        !user ||
+        user.status !== "ACTIVE" ||
+        !user.passwordHash ||
+        !token ||
+        token.consumedAt ||
+        token.revokedAt ||
+        token.expiresAt <= now
+      )
+        return false;
+      await tx.passwordResetToken.update({
+        where: { id: token.id },
+        data: { consumedAt: now },
+      });
+      await tx.passwordResetToken.updateMany({
+        where: { userId: user.id, consumedAt: null, revokedAt: null },
+        data: { revokedAt: now },
+      });
+      await tx.user.update({ where: { id: user.id }, data: { passwordHash } });
+      await revokeUserSessions(tx, user.id, "password_reset", now);
+      return true;
+    });
+    if (!done) throw invalid();
+  }
+
+  /**
+   * Fresh proof of the current password, then a new one. Every session, including the caller's,
+   * is revoked and replaced by one new session, so a stolen older session cannot survive.
+   */
+  async changePassword(
+    userId: number,
+    currentPassword: string,
+    newPassword: string,
+  ) {
+    const candidate = await this.db.user.findUnique({ where: { id: userId } });
+    if (
+      !(await checkPassword(currentPassword, candidate?.passwordHash)) ||
+      !candidate ||
+      candidate.status !== "ACTIVE"
+    )
+      throw new HttpError(
+        400,
+        "CURRENT_PASSWORD_INCORRECT",
+        "The current password is incorrect.",
+      );
+    if (currentPassword === newPassword)
+      throw new HttpError(
+        400,
+        "PASSWORD_UNCHANGED",
+        "Choose a password different from the current one.",
+      );
+    const passwordHash = await hashPassword(newPassword);
+    const result = await this.db.$transaction(async (tx) => {
+      await this.lockUser(tx, userId);
+      const user = await tx.user.findUnique({ where: { id: userId } });
+      if (
+        !user ||
+        user.status !== "ACTIVE" ||
+        user.passwordHash !== candidate.passwordHash
+      )
+        return null;
+      const now = new Date();
+      const updated = await tx.user.update({
+        where: { id: userId },
+        data: { passwordHash },
+      });
+      // A pending reset link must not outlive a deliberate change.
+      await tx.passwordResetToken.updateMany({
+        where: { userId, consumedAt: null, revokedAt: null },
+        data: { revokedAt: now },
+      });
+      await revokeUserSessions(tx, userId, "password_change", now);
+      return this.startSession(tx, updated);
+    });
+    if (!result)
+      throw new HttpError(
+        409,
+        "ACCOUNT_CHANGED",
+        "Your account changed while saving. Sign in again and retry.",
+      );
+    return result;
+  }
+
+  /** The caller's own live sessions: ids and times only, never tokens or network details. */
+  async listSessions(userId: number, currentFamilyId: string) {
+    const now = new Date();
+    const rows = await this.db.authSession.findMany({
+      where: {
+        userId,
+        revokedAt: null,
+        idleExpiresAt: { gt: now },
+        absoluteExpiresAt: { gt: now },
+      },
+      orderBy: [{ lastRefreshedAt: "desc" }, { id: "asc" }],
+      take: 50,
+    });
+    return {
+      items: rows.map((row) => ({
+        id: row.id,
+        authenticatedAt: row.authenticatedAt.toISOString(),
+        lastRefreshedAt: row.lastRefreshedAt.toISOString(),
+        idleExpiresAt: row.idleExpiresAt.toISOString(),
+        absoluteExpiresAt: row.absoluteExpiresAt.toISOString(),
+        current: row.id === currentFamilyId,
+      })),
+    };
+  }
+
+  /** Own sessions only: another account's or an unknown id is a 404. Already revoked is fine. */
+  async revokeSession(userId: number, id: string) {
+    const notFound = () =>
+      new HttpError(404, "SESSION_NOT_FOUND", "Session not found.");
+    if (!/^[0-9a-f-]{36}$/i.test(id)) throw notFound();
+    await this.db.$transaction(async (tx) => {
+      await this.lockUser(tx, userId);
+      const changed = await tx.authSession.updateMany({
+        where: { id, userId, revokedAt: null },
+        data: { revokedAt: new Date(), revocationReason: "session_revoked" },
+      });
+      if (changed.count === 1)
+        await tx.accessGrant.deleteMany({ where: { familyId: id } });
+      else if (
+        !(await tx.authSession.findFirst({
+          where: { id, userId },
+          select: { id: true },
+        }))
+      )
+        throw notFound();
     });
   }
   async authenticate(header: string | undefined) {

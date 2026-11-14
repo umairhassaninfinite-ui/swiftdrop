@@ -7,6 +7,9 @@ import {
   registrationSchema,
   resendVerificationSchema,
   verifyEmailSchema,
+  forgotPasswordSchema,
+  resetPasswordSchema,
+  changePasswordSchema,
   completeProfileSchema,
   googleLinkSchema,
   acceptInvitationSchema,
@@ -69,7 +72,8 @@ export function createAuthRouter(
       return next(
         new HttpError(403, "ORIGIN", "Request origin is not allowed."),
       );
-    if (!req.is("application/json"))
+    // A DELETE carries no body, so only a request that sends one must declare JSON.
+    if (req.method !== "DELETE" && !req.is("application/json"))
       return next(new HttpError(415, "CONTENT_TYPE", "Send application/json."));
     next();
   };
@@ -86,7 +90,9 @@ export function createAuthRouter(
   });
   router.use(
     (req, res, next) =>
-      req.method === "POST" ? originCheck(req, res, next) : next(),
+      req.method === "POST" || req.method === "DELETE"
+        ? originCheck(req, res, next)
+        : next(),
     csrf.doubleCsrfProtection,
   );
   router.get("/providers", (_req, res) =>
@@ -183,6 +189,85 @@ export function createAuthRouter(
       const { token } = verifyEmailSchema.parse(req.body);
       await service.verifyEmail(token);
       res.json({ message: "Your email is verified. You can sign in." });
+    },
+  );
+  router.post(
+    "/forgot-password",
+    limiter.middleware("forgot-password", 10, 3600),
+    async (req, res) => {
+      const { email } = forgotPasswordSchema.parse(req.body);
+      // Three requests per address per hour. Beyond that the request is still accepted with
+      // the same answer, so the limit itself reveals nothing about the address.
+      const hit = await limiter.hit(`forgot-password:email:${email}`, 3, 3600);
+      if (!hit.blocked) await service.requestPasswordReset(email);
+      res.status(202).json({
+        message:
+          "If an account can be reset, an email with a reset link will arrive shortly.",
+      });
+    },
+  );
+  router.post(
+    "/reset-password",
+    limiter.middleware("reset-password", 10, 900),
+    async (req, res) => {
+      const input = resetPasswordSchema.parse(req.body);
+      await service.resetPassword(input.token, input.password);
+      res.json({
+        message: "Your password was changed. Sign in with the new password.",
+      });
+    },
+  );
+  router.post(
+    "/change-password",
+    limiter.middleware("change-password", 30, 900),
+    authenticate(service),
+    async (req, res) => {
+      const input = changePasswordSchema.parse(req.body);
+      const attempts = await limiter.hit(
+        `change-password:user:${res.locals.user.id}`,
+        5,
+        900,
+      );
+      if (attempts.blocked) {
+        res.setHeader("Retry-After", attempts.retryAfter);
+        throw new HttpError(
+          429,
+          "RATE_LIMITED",
+          "Too many password change attempts. Please try again later.",
+        );
+      }
+      const result = await service.changePassword(
+        res.locals.user.id,
+        input.currentPassword,
+        input.newPassword,
+      );
+      res.cookie(names.refresh, result.refreshToken, {
+        ...options,
+        expires: result.cookieExpires,
+      });
+      res.clearCookie(names.csrf, options);
+      res.json(result.response);
+    },
+  );
+  router.get("/sessions", authenticate(service), async (_req, res) => {
+    res.json(
+      await service.listSessions(res.locals.user.id, res.locals.authFamilyId),
+    );
+  });
+  router.delete(
+    "/sessions/:id",
+    limiter.middleware("session-revoke", 60, 60),
+    authenticate(service),
+    async (req, res) => {
+      const id = String(req.params.id);
+      await service.revokeSession(res.locals.user.id, id);
+      // Revoking the session this browser is using signs it out.
+      if (id === res.locals.authFamilyId)
+        res
+          .clearCookie(names.refresh, options)
+          .clearCookie(names.csrf, options)
+          .clearCookie(names.context, options);
+      res.status(204).end();
     },
   );
   router.post(

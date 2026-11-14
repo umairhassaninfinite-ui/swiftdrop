@@ -2,6 +2,10 @@ import { Link, Navigate, Route, Routes, useLocation } from "react-router-dom";
 import { AuthForm } from "./features/auth/forms.js";
 import { roleHome, useSession } from "./features/auth/session.js";
 import { VerifyEmail } from "./features/auth/verification.js";
+import {
+  ForgotPassword,
+  ResetPassword,
+} from "./features/auth/recovery.js";
 import { AcceptInvite } from "./features/auth/accept-invite.js";
 import {
   CompleteProfile,
@@ -86,6 +90,8 @@ export function AppRoutes() {
       <Route path="/auth/register" element={<AuthForm registering />} />
       <Route path="/auth/merchant-register" element={<MerchantSignup />} />
       <Route path="/auth/verify-email" element={<VerifyEmail />} />
+      <Route path="/auth/forgot-password" element={<ForgotPassword />} />
+      <Route path="/auth/reset-password" element={<ResetPassword />} />
       <Route path="/auth/accept-invite" element={<AcceptInvite />} />
       <Route path="/auth/google/result" element={<GoogleResult />} />
       <Route path="/auth/complete-profile" element={<CompleteProfile />} />

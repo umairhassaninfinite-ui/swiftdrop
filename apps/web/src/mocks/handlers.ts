@@ -209,6 +209,63 @@ export const handlers = [
     });
   }),
 
+  // Same answer for every address, exactly like the real endpoint.
+  http.post("/api/v1/auth/forgot-password", () =>
+    HttpResponse.json(
+      {
+        message:
+          "If an account can be reset, an email with a reset link will arrive shortly.",
+      },
+      { status: 202 },
+    ),
+  ),
+
+  http.post("/api/v1/auth/reset-password", () =>
+    HttpResponse.json({
+      message: "Your password was changed. Sign in with the new password.",
+    }),
+  ),
+
+  http.post("/api/v1/auth/change-password", () =>
+    HttpResponse.json({
+      state: "authenticated",
+      accessToken: "mock-access-token-after-password-change",
+      tokenType: "Bearer",
+      expiresIn: 900,
+      user: mockCustomerUser,
+    }),
+  ),
+
+  http.get("/api/v1/auth/sessions", () => {
+    const now = new Date().toISOString();
+    const later = new Date(Date.now() + 86_400_000).toISOString();
+    return HttpResponse.json({
+      items: [
+        {
+          id: "11111111-1111-4111-8111-111111111111",
+          authenticatedAt: now,
+          lastRefreshedAt: now,
+          idleExpiresAt: later,
+          absoluteExpiresAt: later,
+          current: true,
+        },
+        {
+          id: "22222222-2222-4222-8222-222222222222",
+          authenticatedAt: now,
+          lastRefreshedAt: now,
+          idleExpiresAt: later,
+          absoluteExpiresAt: later,
+          current: false,
+        },
+      ],
+    });
+  }),
+
+  http.delete(
+    "/api/v1/auth/sessions/:id",
+    () => new HttpResponse(null, { status: 204 }),
+  ),
+
   http.post("/api/v1/auth/complete-profile", async ({ request }) => {
     const body = (await request.json()) as Record<string, string>;
     return HttpResponse.json({

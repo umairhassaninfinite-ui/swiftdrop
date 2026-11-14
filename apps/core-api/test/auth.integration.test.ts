@@ -14,7 +14,7 @@ import {
 } from "testcontainers";
 import { execFileSync } from "node:child_process";
 import { resolve } from "node:path";
-import { generateKeyPairSync, randomUUID } from "node:crypto";
+import { createHash, generateKeyPairSync, randomUUID } from "node:crypto";
 import bcrypt from "bcrypt";
 import request from "supertest";
 import { Redis } from "ioredis";
@@ -57,6 +57,8 @@ let config: Config;
 let hash: string;
 let verificationLink = "";
 let invitationLink = "";
+let resetLinks: string[] = [];
+let guidanceTo: string[] = [];
 let mailFailure = false;
 let googleIdentityEmail = "google@example.test";
 async function user(role: RoleName = "CUSTOMER", email = input.email) {
@@ -202,6 +204,13 @@ beforeAll(async () => {
         if (mailFailure) throw new Error("smtp unavailable");
         invitationLink = url;
       },
+      sendPasswordReset: async (_email, url) => {
+        if (mailFailure) throw new Error("smtp unavailable");
+        resetLinks.push(url);
+      },
+      sendPasswordResetUnavailable: async (email) => {
+        guidanceTo.push(email);
+      },
     },
     google: {
       enabled: () => true,
@@ -228,6 +237,8 @@ beforeEach(async () => {
   await redis.flushdb();
   verificationLink = "";
   invitationLink = "";
+  resetLinks = [];
+  guidanceTo = [];
   mailFailure = false;
   googleIdentityEmail = "google@example.test";
 });
@@ -236,7 +247,7 @@ afterAll(async () => {
   redis?.disconnect();
   await redisContainer?.stop();
   await postgres?.stop();
-});
+}, 60000);
 describe("customer HTTP boundary", () => {
   it("enforces live service-key revocation across separate internal API instances", async () => {
     const serviceId = "notification-svc";
@@ -2125,5 +2136,488 @@ describe("M01 account administration", () => {
     await expect(
       createAdmin(db, { ...adminInput, password: "short" }),
     ).rejects.toThrow();
+  });
+});
+
+describe("password recovery (auth plan 4.5)", () => {
+  const GENERIC =
+    "If an account can be reset, an email with a reset link will arrive shortly.";
+  const tokenOf = (link: string) => link.split("#token=")[1]!;
+  const sha = (value: string) =>
+    createHash("sha256").update(value).digest("hex");
+  const forgot = (agent: Agent, email: string) =>
+    post(agent, "forgot-password", { email });
+  /** Lets the one-link-per-minute rule pass without waiting a minute. */
+  const ageTokens = () =>
+    db.passwordResetToken.updateMany({
+      data: { createdAt: new Date(Date.now() - 120_000) },
+    });
+  const NEW_PASSWORD = "A brand new passphrase 2026!";
+
+  it("accepts every address the same way and sends a link only to an active password account", async () => {
+    await user();
+    const agent = request.agent(api.app);
+    const known = await forgot(agent, input.email);
+    const unknown = await forgot(request.agent(api.app), "nobody@example.test");
+    expect([known.status, unknown.status]).toEqual([202, 202]);
+    expect(known.body).toEqual({ message: GENERIC });
+    expect(unknown.body).toEqual(known.body);
+    expect(resetLinks).toHaveLength(1);
+    expect(resetLinks[0]).toMatch(
+      /^http:\/\/localhost:5173\/auth\/reset-password#token=[A-Za-z0-9_-]{43}$/,
+    );
+    const stored = await db.passwordResetToken.findFirstOrThrow();
+    expect(stored.tokenHash).toBe(sha(tokenOf(resetLinks[0]!)));
+    expect(JSON.stringify(stored)).not.toContain(tokenOf(resetLinks[0]!));
+    const lifetime = stored.expiresAt.getTime() - stored.createdAt.getTime();
+    // createdAt comes from the database clock, expiresAt from the API's: allow a few ms.
+    expect(Math.abs(lifetime - 30 * 60 * 1000)).toBeLessThan(5000);
+  });
+
+  it("sends nothing for suspended or invited accounts and guidance only to Google-only accounts", async () => {
+    const suspended = await user("CUSTOMER", "suspended@example.test");
+    await db.user.update({
+      where: { id: suspended.id },
+      data: { status: "SUSPENDED" },
+    });
+    const invited = await user("DISPATCHER", "invited@example.test");
+    await db.user.update({
+      where: { id: invited.id },
+      data: { status: "INVITED", passwordHash: null },
+    });
+    const google = await user("CUSTOMER", "gonly@example.test");
+    await db.user.update({
+      where: { id: google.id },
+      data: { passwordHash: null, googleSub: "google-only-sub" },
+    });
+    for (const email of [suspended.email, invited.email, google.email])
+      expect((await forgot(request.agent(api.app), email)).status).toBe(202);
+    expect(resetLinks).toHaveLength(0);
+    expect(guidanceTo).toEqual([google.email]);
+    expect(await db.passwordResetToken.count()).toBe(0);
+    // Guidance never invents a local password.
+    expect(
+      (await db.user.findUniqueOrThrow({ where: { id: google.id } })).passwordHash,
+    ).toBeNull();
+  });
+
+  it("issues one link per minute and replaces the older link", async () => {
+    await user();
+    await forgot(request.agent(api.app), input.email);
+    await forgot(request.agent(api.app), input.email);
+    expect(resetLinks).toHaveLength(1);
+    await ageTokens();
+    await forgot(request.agent(api.app), input.email);
+    expect(resetLinks).toHaveLength(2);
+    const first = await post(request.agent(api.app), "reset-password", {
+      token: tokenOf(resetLinks[0]!),
+      password: NEW_PASSWORD,
+    });
+    expect(first.status).toBe(400);
+    const second = await post(request.agent(api.app), "reset-password", {
+      token: tokenOf(resetLinks[1]!),
+      password: NEW_PASSWORD,
+    });
+    expect(second.status).toBe(200);
+  });
+
+  it("stops mailing after three requests per address per hour, with the same answer", async () => {
+    await user();
+    for (let i = 0; i < 4; i++) {
+      const res = await forgot(request.agent(api.app), input.email);
+      expect(res.status).toBe(202);
+      expect(res.body).toEqual({ message: GENERIC });
+      await ageTokens();
+    }
+    expect(resetLinks).toHaveLength(3);
+  });
+
+  it("does not let a mail outage change the answer or lose the account", async () => {
+    await user();
+    mailFailure = true;
+    const res = await forgot(request.agent(api.app), input.email);
+    expect(res.status).toBe(202);
+    mailFailure = false;
+    await ageTokens();
+    await forgot(request.agent(api.app), input.email);
+    expect(resetLinks.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("sets the password once, signs the account out everywhere, and does not sign in", async () => {
+    const account = await user();
+    const agent = request.agent(api.app);
+    const login = await post(agent, "login", { email: input.email, password });
+    const access = login.body.accessToken as string;
+    await forgot(request.agent(api.app), input.email);
+
+    const reset = await post(request.agent(api.app), "reset-password", {
+      token: tokenOf(resetLinks[0]!),
+      password: NEW_PASSWORD,
+    });
+    expect(reset.status).toBe(200);
+    expect(([] as string[]).concat(reset.headers["set-cookie"] ?? [])).toHaveLength(0);
+    expect(reset.body.accessToken).toBeUndefined();
+
+    // Old credentials and every existing session are gone.
+    await agent
+      .get("/api/v1/auth/me")
+      .set("Authorization", `Bearer ${access}`)
+      .expect(401);
+    expect((await post(agent, "refresh")).status).toBe(401);
+    expect(
+      (await post(request.agent(api.app), "login", { email: input.email, password }))
+        .status,
+    ).toBe(401);
+    expect(
+      (
+        await post(request.agent(api.app), "login", {
+          email: input.email,
+          password: NEW_PASSWORD,
+        })
+      ).status,
+    ).toBe(200);
+    const after = await db.user.findUniqueOrThrow({ where: { id: account.id } });
+    expect(after.passwordHash).toMatch(/^\$2[aby]\$12\$/);
+    expect(after).toMatchObject({ roleId: "CUSTOMER", status: "ACTIVE" });
+  });
+
+  it("works exactly once and gives one answer for every kind of bad token", async () => {
+    await user();
+    await forgot(request.agent(api.app), input.email);
+    const token = tokenOf(resetLinks[0]!);
+    const body = (t: string) => ({ token: t, password: NEW_PASSWORD });
+    const used = await post(request.agent(api.app), "reset-password", body(token));
+    expect(used.status).toBe(200);
+    const replay = await post(request.agent(api.app), "reset-password", body(token));
+    const unknown = await post(
+      request.agent(api.app),
+      "reset-password",
+      body("A".repeat(43)),
+    );
+    const malformed = await post(
+      request.agent(api.app),
+      "reset-password",
+      body("short"),
+    );
+    expect([replay.status, unknown.status, malformed.status]).toEqual([400, 400, 400]);
+    expect(replay.body.code ?? replay.body.type).toBe(unknown.body.code ?? unknown.body.type);
+    expect(replay.body.detail).toBe(unknown.body.detail);
+  });
+
+  it("refuses an expired token and leaves the password alone", async () => {
+    await user();
+    await forgot(request.agent(api.app), input.email);
+    await db.passwordResetToken.updateMany({
+      data: {
+        createdAt: new Date(Date.now() - 3_600_000),
+        expiresAt: new Date(Date.now() - 60_000),
+      },
+    });
+    const res = await post(request.agent(api.app), "reset-password", {
+      token: tokenOf(resetLinks[0]!),
+      password: NEW_PASSWORD,
+    });
+    expect(res.status).toBe(400);
+    expect(
+      (await post(request.agent(api.app), "login", { email: input.email, password }))
+        .status,
+    ).toBe(200);
+  });
+
+  it("rejects a weak password without consuming the token", async () => {
+    await user();
+    await forgot(request.agent(api.app), input.email);
+    const token = tokenOf(resetLinks[0]!);
+    for (const weak of ["short", "films+pic+galeries", "x".repeat(80)]) {
+      const res = await post(request.agent(api.app), "reset-password", {
+        token,
+        password: weak,
+      });
+      expect([400, 422]).toContain(res.status);
+    }
+    expect(
+      (
+        await post(request.agent(api.app), "reset-password", {
+          token,
+          password: NEW_PASSWORD,
+        })
+      ).status,
+    ).toBe(200);
+  });
+
+  it("lets only one of two simultaneous resets win", async () => {
+    await user();
+    await forgot(request.agent(api.app), input.email);
+    const token = tokenOf(resetLinks[0]!);
+    const results = await Promise.all(
+      ["First concurrent passphrase 1!", "Second concurrent passphrase 2!"].map((p) =>
+        post(request.agent(api.app), "reset-password", { token, password: p }),
+      ),
+    );
+    expect(results.map((r) => r.status).sort()).toEqual([200, 400]);
+  });
+
+  it("does not unsuspend, and a suspended account's link is dead", async () => {
+    const account = await user();
+    await forgot(request.agent(api.app), input.email);
+    await db.user.update({
+      where: { id: account.id },
+      data: { status: "SUSPENDED" },
+    });
+    const res = await post(request.agent(api.app), "reset-password", {
+      token: tokenOf(resetLinks[0]!),
+      password: NEW_PASSWORD,
+    });
+    expect(res.status).toBe(400);
+    expect(
+      (await db.user.findUniqueOrThrow({ where: { id: account.id } })).status,
+    ).toBe("SUSPENDED");
+  });
+
+  it("keeps verification and reset tokens separate", async () => {
+    await user();
+    await forgot(request.agent(api.app), input.email);
+    const verify = await post(request.agent(api.app), "verify-email", {
+      token: tokenOf(resetLinks[0]!),
+    });
+    expect(verify.status).toBe(400);
+    expect(await db.passwordResetToken.count({ where: { consumedAt: null } })).toBe(1);
+    await post(request.agent(api.app), "resend-verification", { email: input.email });
+    if (verificationLink) {
+      const reuse = await post(request.agent(api.app), "reset-password", {
+        token: verificationLink.split("#token=")[1]!,
+        password: NEW_PASSWORD,
+      });
+      expect(reuse.status).toBe(400);
+    }
+  });
+});
+
+describe("change password and session management (auth plan 4.3)", () => {
+  const NEW_PASSWORD = "Changed passphrase for tests 1!";
+  async function signIn() {
+    const agent = request.agent(api.app);
+    const res = await post(agent, "login", { email: input.email, password });
+    return { agent, access: res.body.accessToken as string };
+  }
+  const bearer = (token: string) => ({ Authorization: `Bearer ${token}` });
+  /** DELETE /sessions/:id the way the SPA does: bearer, exact Origin and a CSRF token. */
+  async function revokeSession(agent: Agent, token: string, id: string) {
+    const context = await agent.get("/api/v1/auth/csrf").expect(200);
+    return agent
+      .delete(`/api/v1/auth/sessions/${id}`)
+      .set("Origin", config.APP_ORIGIN)
+      .set("X-CSRF-Token", context.body.csrfToken)
+      .set(bearer(token));
+  }
+
+  async function changePassword(agent: Agent, token: string, body: object) {
+    const context = await agent.get("/api/v1/auth/csrf").expect(200);
+    return agent
+      .post("/api/v1/auth/change-password")
+      .set("Origin", config.APP_ORIGIN)
+      .set("X-CSRF-Token", context.body.csrfToken)
+      .set(bearer(token))
+      .send(body);
+  }
+
+  it("requires authentication and the right current password, and changes nothing otherwise", async () => {
+    const account = await user();
+    const before = account.passwordHash;
+    expect(
+      (await post(request.agent(api.app), "change-password", {
+        currentPassword: password,
+        newPassword: NEW_PASSWORD,
+      })).status,
+    ).toBe(401);
+    const { agent, access } = await signIn();
+    const wrong = await changePassword(agent, access, {
+      currentPassword: "Not the current passphrase!",
+      newPassword: NEW_PASSWORD,
+    });
+    expect(wrong.status).toBe(400);
+    expect(wrong.body.code ?? wrong.body.type).toMatch(/CURRENT_PASSWORD_INCORRECT/);
+    const same = await changePassword(agent, access, {
+      currentPassword: password,
+      newPassword: password,
+    });
+    expect(same.status).toBe(400);
+    const weak = await changePassword(agent, access, {
+      currentPassword: password,
+      newPassword: "short",
+    });
+    expect([400, 422]).toContain(weak.status);
+    expect(
+      (await db.user.findUniqueOrThrow({ where: { id: account.id } })).passwordHash,
+    ).toBe(before);
+    await agent.get("/api/v1/auth/me").set(bearer(access)).expect(200);
+  });
+
+  it("replaces every session with one new session and a new password", async () => {
+    await user();
+    const first = await signIn();
+    const other = await signIn();
+    const res = await changePassword(first.agent, first.access, {
+      currentPassword: password,
+      newPassword: NEW_PASSWORD,
+    });
+    expect(res.status).toBe(200);
+    expect(res.body.state).toBe("authenticated");
+    expect(([] as string[]).concat(res.headers["set-cookie"] ?? []).join(";")).toMatch(/swiftdrop-refresh=/);
+    await first.agent.get("/api/v1/auth/me").set(bearer(first.access)).expect(401);
+    await other.agent.get("/api/v1/auth/me").set(bearer(other.access)).expect(401);
+    await first.agent
+      .get("/api/v1/auth/me")
+      .set(bearer(res.body.accessToken))
+      .expect(200);
+    expect((await post(other.agent, "refresh")).status).toBe(401);
+    expect(
+      (await post(request.agent(api.app), "login", { email: input.email, password }))
+        .status,
+    ).toBe(401);
+    expect(
+      (
+        await post(request.agent(api.app), "login", {
+          email: input.email,
+          password: NEW_PASSWORD,
+        })
+      ).status,
+    ).toBe(200);
+  });
+
+  it("revokes a pending reset link when the password is changed deliberately", async () => {
+    await user();
+    await post(request.agent(api.app), "forgot-password", { email: input.email });
+    const link = resetLinks[0]!;
+    const { agent, access } = await signIn();
+    await changePassword(agent, access, {
+      currentPassword: password,
+      newPassword: NEW_PASSWORD,
+    });
+    const res = await post(request.agent(api.app), "reset-password", {
+      token: link.split("#token=")[1]!,
+      password: "Another passphrase for tests 3!",
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("limits guesses at the current password", async () => {
+    await user();
+    const { agent, access } = await signIn();
+    const statuses: number[] = [];
+    for (let i = 0; i < 6; i++)
+      statuses.push(
+        (
+          await changePassword(agent, access, {
+            currentPassword: `wrong guess number ${i} here`,
+            newPassword: NEW_PASSWORD,
+          })
+        ).status,
+      );
+    expect(statuses.slice(0, 5)).toEqual([400, 400, 400, 400, 400]);
+    expect(statuses[5]).toBe(429);
+  });
+
+  it("lists only the caller's live sessions, marks the current one and exposes no secrets", async () => {
+    const account = await user();
+    const other = await user("CUSTOMER", "someone-else@example.test");
+    const mine = await signIn();
+    await signIn();
+    await api.service.login(other.email, password);
+    const res = await mine.agent.get("/api/v1/auth/sessions").set(bearer(mine.access));
+    expect(res.status).toBe(200);
+    expect(res.body.items).toHaveLength(2);
+    expect(res.body.items.filter((s: { current: boolean }) => s.current)).toHaveLength(1);
+    expect(Object.keys(res.body.items[0]).sort()).toEqual(
+      ["absoluteExpiresAt", "authenticatedAt", "current", "id", "idleExpiresAt", "lastRefreshedAt"],
+    );
+    const ids = await db.authSession.findMany({ where: { userId: account.id } });
+    expect(res.body.items.map((s: { id: string }) => s.id).sort()).toEqual(
+      ids.map((s) => s.id).sort(),
+    );
+    await request(api.app).get("/api/v1/auth/sessions").expect(401);
+  });
+
+  it("omits revoked and expired sessions", async () => {
+    const account = await user();
+    const mine = await signIn();
+    const revoked = await api.service.login(input.email, password);
+    const idle = await api.service.login(input.email, password);
+    await api.service.logout(revoked.refreshToken);
+    const idleRow = await db.authSession.findMany({
+      where: { userId: account.id, revokedAt: null },
+      orderBy: { authenticatedAt: "desc" },
+    });
+    await db.authSession.update({
+      where: { id: idleRow[0]!.id },
+      data: { idleExpiresAt: new Date(Date.now() - 1000) },
+    });
+    void idle;
+    const res = await mine.agent.get("/api/v1/auth/sessions").set(bearer(mine.access));
+    expect(res.body.items).toHaveLength(1);
+    expect(res.body.items[0].current).toBe(true);
+  });
+
+  it("revokes another session at once and leaves the caller signed in", async () => {
+    await user();
+    const mine = await signIn();
+    const other = await signIn();
+    const list = await mine.agent.get("/api/v1/auth/sessions").set(bearer(mine.access));
+    const target = list.body.items.find((s: { current: boolean }) => !s.current);
+    const res = await revokeSession(mine.agent, mine.access, target.id);
+    expect(res.status).toBe(204);
+    await other.agent.get("/api/v1/auth/me").set(bearer(other.access)).expect(401);
+    expect((await post(other.agent, "refresh")).status).toBe(401);
+    await mine.agent.get("/api/v1/auth/me").set(bearer(mine.access)).expect(200);
+    // Revoking again is harmless.
+    expect((await revokeSession(mine.agent, mine.access, target.id)).status).toBe(204);
+  });
+
+  it("signs this browser out when its own session is revoked", async () => {
+    await user();
+    const mine = await signIn();
+    const list = await mine.agent.get("/api/v1/auth/sessions").set(bearer(mine.access));
+    const current = list.body.items.find((s: { current: boolean }) => s.current);
+    const res = await revokeSession(mine.agent, mine.access, current.id);
+    expect(res.status).toBe(204);
+    expect(([] as string[]).concat(res.headers["set-cookie"] ?? []).join(";")).toMatch(/swiftdrop-refresh=;/);
+    await mine.agent.get("/api/v1/auth/me").set(bearer(mine.access)).expect(401);
+  });
+
+  it("hides other accounts' sessions behind 404 and leaves them untouched", async () => {
+    const victim = await user("CUSTOMER", "victim@example.test");
+    const theirs = await api.service.login(victim.email, password);
+    const theirId = (await db.authSession.findFirstOrThrow({ where: { userId: victim.id } })).id;
+    await user();
+    const mine = await signIn();
+    for (const id of [theirId, "00000000-0000-4000-8000-000000000000", "not-a-uuid"]) {
+      const res = await revokeSession(mine.agent, mine.access, id);
+      expect(res.status).toBe(404);
+    }
+    await expect(
+      api.service.authenticate(`Bearer ${theirs.response.accessToken}`),
+    ).resolves.toBeDefined();
+    expect(
+      (await db.authSession.findUniqueOrThrow({ where: { id: theirId } })).revokedAt,
+    ).toBeNull();
+  });
+
+  it("requires the CSRF token and the exact Origin to revoke a session", async () => {
+    await user();
+    const mine = await signIn();
+    const list = await mine.agent.get("/api/v1/auth/sessions").set(bearer(mine.access));
+    const id = list.body.items[0].id;
+    const context = await mine.agent.get("/api/v1/auth/csrf").expect(200);
+    const noToken = await mine.agent
+      .delete(`/api/v1/auth/sessions/${id}`)
+      .set("Origin", config.APP_ORIGIN)
+      .set(bearer(mine.access));
+    const badOrigin = await mine.agent
+      .delete(`/api/v1/auth/sessions/${id}`)
+      .set("Origin", "https://evil.example.test")
+      .set("X-CSRF-Token", context.body.csrfToken)
+      .set(bearer(mine.access));
+    expect([noToken.status, badOrigin.status]).toEqual([403, 403]);
+    await mine.agent.get("/api/v1/auth/me").set(bearer(mine.access)).expect(200);
   });
 });

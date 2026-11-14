@@ -44,6 +44,10 @@ import {
   type MerchantOrderStatus,
   type CreateMerchantApiClient,
   emptySchema,
+  forgotPasswordSchema,
+  resetPasswordSchema,
+  changePasswordSchema,
+  sessionListSchema,
   merchantWebhookSettingsSchema,
   saveMerchantWebhookSchema,
   saveMerchantWebhookResponseSchema,
@@ -623,6 +627,85 @@ export async function verifyEmail(token: string) {
       }),
     );
   });
+}
+export async function requestPasswordReset(email: string) {
+  return authLock(async () => {
+    const context = await csrf();
+    return checked(
+      await api.POST("/api/v1/auth/forgot-password", {
+        body: forgotPasswordSchema.parse({ email }),
+        headers: { "X-CSRF-Token": context.csrfToken },
+      }),
+    );
+  });
+}
+export async function resetPassword(token: string, password: string) {
+  return authLock(async () => {
+    const context = await csrf();
+    return checked(
+      await api.POST("/api/v1/auth/reset-password", {
+        body: resetPasswordSchema.parse({ token, password }),
+        headers: { "X-CSRF-Token": context.csrfToken },
+      }),
+    );
+  });
+}
+/**
+ * The server revokes every session, this one included, and answers with one new session. Other
+ * tabs find out on their next request, so only this tab keeps the new token.
+ */
+export async function changePassword(
+  currentPassword: string,
+  newPassword: string,
+) {
+  const result = await authenticated(async (session) => {
+    const context = await csrf();
+    return sessionSchema.parse(
+      await checked(
+        await api.POST("/api/v1/auth/change-password", {
+          body: changePasswordSchema.parse({ currentPassword, newPassword }),
+          headers: {
+            Authorization: `Bearer ${session.accessToken}`,
+            "X-CSRF-Token": context.csrfToken,
+          },
+        }),
+      ),
+    );
+  });
+  current = result;
+  return result;
+}
+export async function listSessions() {
+  return authenticated(
+    async (session) =>
+      sessionListSchema.parse(
+        await checked(
+          await api.GET("/api/v1/auth/sessions", {
+            headers: { Authorization: `Bearer ${session.accessToken}` },
+          }),
+        ),
+      ),
+    true,
+  );
+}
+/** Revoking this browser's own session also signs it out; the caller then clears its state. */
+export async function revokeSession(id: string, isCurrent: boolean) {
+  await authenticated(async (session) => {
+    const context = await csrf();
+    await checked(
+      await api.DELETE("/api/v1/auth/sessions/{id}", {
+        params: { path: { id } },
+        headers: {
+          Authorization: `Bearer ${session.accessToken}`,
+          "X-CSRF-Token": context.csrfToken,
+        },
+      }),
+    );
+  });
+  if (isCurrent) {
+    clearSession();
+    sessionEvents?.postMessage("signed-out");
+  }
 }
 export async function googleProviders() {
   return checked(await api.GET("/api/v1/auth/providers"));

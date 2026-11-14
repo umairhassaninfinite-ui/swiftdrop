@@ -256,6 +256,38 @@ export const resendVerificationSchema = z
 export const verifyEmailSchema = z
   .object({ token: z.string().regex(/^[A-Za-z0-9_-]{43}$/) })
   .strict();
+export const forgotPasswordSchema = z.object({ email: emailSchema }).strict();
+export const resetPasswordSchema = z
+  .object({
+    token: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+    password: passwordSchema,
+  })
+  .strict();
+export const changePasswordSchema = z
+  .object({
+    // Not subject to the new-password policy: it only has to match what is stored.
+    currentPassword: z
+      .string()
+      .min(1)
+      .refine(
+        (value) => new TextEncoder().encode(value).length <= 72,
+        "Password exceeds 72 UTF-8 bytes.",
+      ),
+    newPassword: passwordSchema,
+  })
+  .strict();
+export const sessionSummarySchema = z.object({
+  id: z.string().uuid(),
+  authenticatedAt: z.string().datetime(),
+  lastRefreshedAt: z.string().datetime(),
+  idleExpiresAt: z.string().datetime(),
+  absoluteExpiresAt: z.string().datetime(),
+  current: z.boolean(),
+});
+export const sessionListSchema = z.object({
+  items: z.array(sessionSummarySchema),
+});
+export type SessionSummary = z.infer<typeof sessionSummarySchema>;
 export const completeProfileSchema = z
   .object({
     fullName: z

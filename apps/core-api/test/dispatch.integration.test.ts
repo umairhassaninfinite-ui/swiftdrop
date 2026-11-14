@@ -698,3 +698,225 @@ describe("courier invitation activation (C-04 / X-15)", () => {
     ).toBe("COURIER_OFF_DUTY");
   });
 });
+
+describe("three-attempt rule through LifecycleService (FR-P4)", () => {
+  async function outForDelivery(c: number) {
+    const parcel = await newParcel();
+    await dispatch.assign(dispatcherId, parcel.id, c, 1);
+    for (const [to, expected] of [
+      ["PICKED_UP", 2],
+      ["IN_TRANSIT", 3],
+      ["OUT_FOR_DELIVERY", 4],
+    ] as const)
+      await lifecycle.transition(parcel.id, to, "Colombo", expected);
+    return parcel;
+  }
+
+  it("counts three attempts, then refuses a fourth and leaves the parcel untouched", async () => {
+    const c = await newCourier();
+    const parcel = await outForDelivery(c);
+    const attempts = async () =>
+      (await db.parcel.findUniqueOrThrow({ where: { id: parcel.id } }))
+        .attemptCount;
+    expect(await attempts()).toBe(1);
+    await lifecycle.transition(parcel.id, "FAILED", "Kandy", 5);
+    await lifecycle.transition(parcel.id, "OUT_FOR_DELIVERY", "Kandy", 6);
+    expect(await attempts()).toBe(2);
+    await lifecycle.transition(parcel.id, "FAILED", "Kandy", 7);
+    await lifecycle.transition(parcel.id, "OUT_FOR_DELIVERY", "Kandy", 8);
+    expect(await attempts()).toBe(3);
+    await lifecycle.transition(parcel.id, "FAILED", "Kandy", 9);
+    expect(await workload(c)).toBe(0);
+
+    const history = await db.parcelHistory.count({
+      where: { parcelId: parcel.id },
+    });
+    const events = await db.outboxEvent.count({
+      where: { aggregateId: parcel.id, eventType: "parcel.status.changed" },
+    });
+    const refused = await problem(
+      lifecycle.transition(parcel.id, "OUT_FOR_DELIVERY", "Kandy", 10),
+    );
+    expect(refused).toMatchObject({
+      status: 409,
+      code: "MAX_ATTEMPTS_REACHED",
+    });
+    const after = await db.parcel.findUniqueOrThrow({
+      where: { id: parcel.id },
+    });
+    expect(after).toMatchObject({
+      status: "FAILED",
+      attemptCount: 3,
+      version: 10,
+    });
+    expect(
+      await db.parcelHistory.count({ where: { parcelId: parcel.id } }),
+    ).toBe(history);
+    expect(
+      await db.outboxEvent.count({
+        where: { aggregateId: parcel.id, eventType: "parcel.status.changed" },
+      }),
+    ).toBe(events);
+    expect(await workload(c)).toBe(0);
+  });
+});
+
+describe("cancellation, duty and status races", () => {
+  const ROUNDS = 6;
+  const won = (outcomes: PromiseSettledResult<unknown>[]) =>
+    outcomes.filter((o) => o.status === "fulfilled").length;
+  const lostWith409 = (outcomes: PromiseSettledResult<unknown>[]) =>
+    outcomes.every(
+      (o) =>
+        o.status === "fulfilled" ||
+        (o.reason instanceof HttpError && o.reason.status === 409),
+    );
+  /** The ledger must always agree with itself: workload is exactly the unreleased assignments. */
+  async function expectLedgerConsistent(courierId: number) {
+    const profile = await db.courierProfile.findUniqueOrThrow({
+      where: { userId: courierId },
+    });
+    const held = await db.parcelAssignment.count({
+      where: { courierId, releasedAt: null },
+    });
+    expect(profile.workload).toBe(held);
+    expect(profile.workload).toBeLessThanOrEqual(profile.capacity);
+  }
+  async function outForDelivery(c: number) {
+    const parcel = await newParcel();
+    await dispatch.assign(dispatcherId, parcel.id, c, 1);
+    for (const [to, expected] of [
+      ["PICKED_UP", 2],
+      ["IN_TRANSIT", 3],
+      ["OUT_FOR_DELIVERY", 4],
+    ] as const)
+      await lifecycle.transition(parcel.id, to, "Colombo", expected);
+    return parcel;
+  }
+
+  it("lets exactly one of a cancellation and a pickup win on the same version", async () => {
+    for (let round = 0; round < ROUNDS; round++) {
+      const parcel = await newParcel();
+      const outcomes = await Promise.allSettled([
+        lifecycle.cancel(parcel.id, dispatcherId, "DISPATCHER", 1),
+        lifecycle.transition(parcel.id, "PICKED_UP", "Colombo", 1),
+      ]);
+      expect(won(outcomes)).toBe(1);
+      expect(lostWith409(outcomes)).toBe(true);
+      const row = await db.parcel.findUniqueOrThrow({
+        where: { id: parcel.id },
+      });
+      expect(["CANCELLED", "PICKED_UP"]).toContain(row.status);
+      expect(row.version).toBe(2);
+      // One status change means exactly one history row (the fixture adds no CREATED row) and
+      // one event, matching the winner.
+      const history = await db.parcelHistory.findMany({
+        where: { parcelId: parcel.id },
+      });
+      expect(history.map((h) => h.status)).toEqual([row.status]);
+      const events = await db.outboxEvent.findMany({
+        where: { aggregateId: parcel.id, eventType: "parcel.status.changed" },
+      });
+      expect(events).toHaveLength(1);
+      expect(events[0]!.payload).toMatchObject({ data: { to: row.status } });
+    }
+  });
+
+  it("never leaves a cancelled parcel assigned when a cancellation races an assignment", async () => {
+    for (let round = 0; round < ROUNDS; round++) {
+      const c = await newCourier();
+      const parcel = await newParcel();
+      const outcomes = await Promise.allSettled([
+        dispatch.assign(dispatcherId, parcel.id, c, 1),
+        lifecycle.cancel(parcel.id, dispatcherId, "DISPATCHER", 1),
+      ]);
+      expect(won(outcomes)).toBe(1);
+      expect(lostWith409(outcomes)).toBe(true);
+      const row = await db.parcel.findUniqueOrThrow({
+        where: { id: parcel.id },
+      });
+      const held = await db.parcelAssignment.count({
+        where: { parcelId: parcel.id, releasedAt: null },
+      });
+      if (row.status === "CANCELLED") expect(held).toBe(0);
+      else expect(held).toBe(1);
+      expect(row.version).toBe(2);
+      await expectLedgerConsistent(c);
+    }
+  });
+
+  it("applies one of two conflicting final statuses and releases capacity at most once", async () => {
+    for (let round = 0; round < ROUNDS; round++) {
+      const c = await newCourier();
+      const parcel = await outForDelivery(c);
+      const outcomes = await Promise.allSettled([
+        lifecycle.transition(parcel.id, "DELIVERED", "Kandy", 5),
+        lifecycle.transition(parcel.id, "FAILED", "Kandy", 5),
+      ]);
+      expect(won(outcomes)).toBe(1);
+      expect(lostWith409(outcomes)).toBe(true);
+      const row = await db.parcel.findUniqueOrThrow({
+        where: { id: parcel.id },
+      });
+      // Delivered frees the slot; a first failure keeps it for the re-attempt.
+      expect(await workload(c)).toBe(row.status === "DELIVERED" ? 0 : 1);
+      expect(row.version).toBe(6);
+      await expectLedgerConsistent(c);
+    }
+  });
+
+  it("releases capacity once when the same delivery is submitted concurrently", async () => {
+    const c = await newCourier();
+    const parcels = [await outForDelivery(c), await outForDelivery(c)];
+    expect(await workload(c)).toBe(2);
+    const outcomes = await Promise.allSettled([
+      lifecycle.transition(parcels[0]!.id, "DELIVERED", "Kandy", 5),
+      lifecycle.transition(parcels[0]!.id, "DELIVERED", "Kandy", 5),
+      lifecycle.transition(parcels[0]!.id, "DELIVERED", "Kandy", 5),
+    ]);
+    expect(won(outcomes)).toBe(1);
+    expect(await workload(c)).toBe(1);
+    await expectLedgerConsistent(c);
+  });
+
+  it("keeps workload within capacity when a delivery races a capacity reduction", async () => {
+    for (let round = 0; round < ROUNDS; round++) {
+      const c = await newCourier({ capacity: 2 });
+      const first = await outForDelivery(c);
+      await outForDelivery(c);
+      const outcomes = await Promise.allSettled([
+        lifecycle.transition(first.id, "DELIVERED", "Kandy", 5),
+        dispatch.updateProfile(c, { capacity: 1 }),
+      ]);
+      // The delivery always succeeds; the reduction succeeds only if it ran after the release.
+      expect(outcomes[0]!.status).toBe("fulfilled");
+      const reduction = outcomes[1]!;
+      if (reduction.status === "rejected")
+        expect((reduction.reason as HttpError).code).toBe(
+          "CAPACITY_BELOW_WORKLOAD",
+        );
+      await expectLedgerConsistent(c);
+    }
+  });
+
+  it("either assigns before the courier goes off duty or refuses, never half of each", async () => {
+    for (let round = 0; round < ROUNDS; round++) {
+      const c = await newCourier();
+      const parcel = await newParcel();
+      const outcomes = await Promise.allSettled([
+        dispatch.assign(dispatcherId, parcel.id, c, 1),
+        courier.setDuty(c, false),
+      ]);
+      expect(outcomes[1]!.status).toBe("fulfilled");
+      const assignment = outcomes[0]!;
+      if (assignment.status === "rejected")
+        expect((assignment.reason as HttpError).code).toBe("COURIER_OFF_DUTY");
+      expect(await workload(c)).toBe(assignment.status === "fulfilled" ? 1 : 0);
+      expect(
+        (await db.courierProfile.findUniqueOrThrow({ where: { userId: c } }))
+          .onDuty,
+      ).toBe(false);
+      await expectLedgerConsistent(c);
+    }
+  });
+});

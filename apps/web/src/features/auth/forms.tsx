@@ -246,7 +246,7 @@ export function AuthForm({ registering = false }: { registering?: boolean }) {
               : "Google sign-in is unavailable. Use your email and password."}
           </p>
           <p className="fine">
-            Password recovery is planned for a later phase.
+            <Link to="/auth/forgot-password">Forgot your password?</Link>
           </p>
         </>
       )}

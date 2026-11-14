@@ -22,6 +22,10 @@ Recorded deviation from Table 9: `webhooks.q` has one extra binding, `webhook.re
 
 Queue arguments cannot change on a live queue. After pulling this change, delete an older broker's `swiftdrop.events` direct exchange and `swiftdrop.event-log` queue (`docker compose down -v` for a disposable dev broker).
 
+## Correlation ids (NFR-13)
+
+A request's `X-Correlation-ID` (accepted only as 8-64 characters of `A-Z a-z 0-9 . _ -`, otherwise a new UUID is generated) is stored in `outbox_events.correlation_id` by `outbox.add` and by the lifecycle writers, using the request-scoped context in `apps/core-api/src/shared/correlation.ts`. The relay re-validates it and publishes it as the AMQP header `x-correlation-id`. It is deliberately **not** part of the envelope, which stays the consumer contract. `notification-svc`, `webhook-svc`, the realtime consumer and the receipt worker log it; `webhook-svc` also copies it onto retry and DLQ hand-offs so it survives the retry queues. Events written outside an HTTP request, or before migration `202611140002`, have none. It is not sent to merchants in webhook requests.
+
 ## Delivery guarantees
 
 - **Producer:** state, history and outbox row commit together. The relay claims rows `FOR UPDATE SKIP LOCKED`, publishes `mandatory` + persistent with publisher confirms, and marks only the confirmed prefix. A crash between confirm and commit republishes the same `eventId` (at-least-once).
@@ -51,7 +55,7 @@ FR-I1 relay, FR-I2 topology, FR-I4 dispatcher, X-11 merchant webhook configurati
 - Merchant-facing events are `parcel.created` and `parcel.status.changed`, and they carry `merchantId` only for merchant-owned parcels. Assignment events carry internal courier ids and never carry `merchantId`, so they are not delivered by webhook.
 - Status events still include the courier's internal numeric `courierId` in `data`, which webhook merchants receive. Decide whether to drop it from merchant payloads.
 - Merchant-scoped delivery log: `WebhooksService.list({ merchantId })` exists for M02 to mount; there is no merchant-facing route yet.
-- Correlation-id propagation API → outbox → consumers (NFR-13, M10) is not done. Dockerfiles, Compose entries and CI path filters for the two new services (X-14) are not added.
+- Dockerfiles and Compose entries for the two services now exist (see [operations.md](operations.md)); CI path filters (X-14) were not checked.
 - Graceful shutdown (finish in-flight messages on SIGTERM) is implemented but not verified: no automated test covers it, and the only local run was on Windows, where `kill` does not deliver a catchable signal. Check it on Linux/CI or in a container.
 
 ## Manual test: retries, DLQ and replay
@@ -75,3 +79,5 @@ pnpm db:generate && docker compose up -d --wait && pnpm db:migrate && pnpm db:se
 ## Checks run for this slice
 
 `pnpm --filter @swiftdrop/messaging test`, `pnpm --filter outbox-relay test`, `pnpm --filter webhook-svc test` (unit: topology, envelope privacy, relay batching/quarantine/ordering, signing, SSRF guard, HTTP sender, full processor state machine including crash/resume and replay); `pnpm --filter webhook-svc test:integration` (real RabbitMQ 4 + PostgreSQL via Testcontainers: delivery, ladder through the retry queues, seven attempts then DLQ, replay, no fan-out, mandatory-routing rejection); core-api integration (envelope on booking; Admin list/detail/replay, concurrency, role/CSRF/origin denial); web tests with axe on the new page.
+
+Cross-service checks in `apps/core-api/test` (real PostgreSQL, RabbitMQ and, for receipts, MinIO via Testcontainers; run on Node 24, which Jest needs to load `minio`): `eventflow.integration.test.ts` drives the real `LifecycleService`, outbox, relay `publishBatch`, production topology, webhook consumer/processor and notification processor, and asserts that one status update gives exactly one notification and one signed webhook (verified signature, original `eventId`), stays at one each when the broker redelivers the event, sends no webhook for a parcel without a merchant, keeps two parcels independent, and carries the request's correlation id across the broker. The merchant URL there comes from a stub config source, not the HTTP source, and the receiver and email/SMS senders are recorders. `receipts.integration.test.ts` covers PDF generation, signed download and regeneration against a live MinIO.
